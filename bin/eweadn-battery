@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Read the battery level of an EWEADN S9 mouse from its 2.4 GHz receiver.
+"""Read and configure an EWEADN S9-series mouse over its 2.4 GHz receiver.
 
 The receiver exposes a 64-byte vendor feature report (report ID 3, usage page
-0xFF00).  The query was captured from EWEADN's own web driver and is also used
-by the Voltide project.  It is read-only: the only command sent is "get basic
-info".
+0xFF00).  The queries and write commands below were recovered from EWEADN's
+official web driver and the @bytech/mouse-pix SDK.
 
-Protocol:
-    request: 03 20 50 00 00 4F 81 00 ...          (64 bytes, report ID first)
-    reply:   03 50 00 0B 00 01 <level> <status> ... A5 5A
-             byte 6 low 7 bits = percent, bit 7 = charging
-             charging reports the sentinel 0xE4, so no percentage is shown
-             while charging.
+Battery output is backwards compatible with the original helper:
 
-Exit codes: 0 ok, 2 no device, 3 permission denied, 4 no reply/asleep,
-5 unexpected reply.
+    eweadn-battery --json
+
+New commands:
+
+    eweadn-battery config --json
+    eweadn-battery set-polling 8000 --apply
+    eweadn-battery set-dpi 1 1600 --apply
+    eweadn-battery set-button back dpi_loop --apply
+    eweadn-battery backup
+
+Writes are dry-run unless --apply is passed.  Every applied write saves the
+current configuration first and reads it back afterwards.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 
 VID = 0x372E
 KNOWN_PIDS = {
@@ -42,6 +47,90 @@ CABLE_PIDS = {0x1027}
 REPORT_ID = 0x03
 FRAME_SIZE = 64
 HID_NAME_MATCH = "eweadn"
+
+POLLING_RATES = {
+    0: 1000,
+    1: 500,
+    2: 250,
+    3: 125,
+    4: 8000,
+    5: 4000,
+    6: 2000,
+}
+HZ_TO_CODE = {hz: code for code, hz in POLLING_RATES.items()}
+
+# Exact values from @bytech/mouse-pix 1.11.1.
+KEY_POS = {
+    "left": 0,
+    "right": 4,
+    "middle": 8,
+    "back": 12,
+    "forward": 16,
+}
+KEY_TYPE = {
+    "keyboard": 0,
+    "mouse": 1,
+    "multimedia": 2,
+    "macro": 3,
+    "custom": 4,
+    "dpi": 5,
+    "profile": 6,
+    "report": 9,
+}
+MOUSE_CODE = {
+    "left": 1,
+    "right": 2,
+    "middle": 3,
+    "forward": 4,
+    "back": 5,
+}
+MOUSE_CODE_NAME = {value: name for name, value in MOUSE_CODE.items()}
+BUTTON_NAMES = ["left", "right", "middle", "back", "forward"]
+
+# (keyType, keyCode, times, gap)
+BUTTON_ACTIONS = {
+    "left": (KEY_TYPE["mouse"], MOUSE_CODE["left"], 1, 0),
+    "right": (KEY_TYPE["mouse"], MOUSE_CODE["right"], 1, 0),
+    "middle": (KEY_TYPE["mouse"], MOUSE_CODE["middle"], 1, 0),
+    "forward": (KEY_TYPE["mouse"], MOUSE_CODE["forward"], 1, 0),
+    "back": (KEY_TYPE["mouse"], MOUSE_CODE["back"], 1, 0),
+    "dpi_up": (KEY_TYPE["dpi"], 1, 1, 0),
+    "dpi_down": (KEY_TYPE["dpi"], 2, 1, 0),
+    "dpi_loop": (KEY_TYPE["dpi"], 4, 1, 0),
+    "profile_1": (KEY_TYPE["profile"], 1, 0, 0),
+    "profile_2": (KEY_TYPE["profile"], 2, 0, 0),
+    "profile_3": (KEY_TYPE["profile"], 3, 0, 0),
+    "profile_4": (KEY_TYPE["profile"], 4, 0, 0),
+    "profile_cycle": (KEY_TYPE["profile"], 5, 0, 0),
+    "media_play_pause": (KEY_TYPE["multimedia"], 0, 0, 0xCD),
+    "media_next": (KEY_TYPE["multimedia"], 0, 0, 0xB5),
+    "media_prev": (KEY_TYPE["multimedia"], 0, 0, 0xB6),
+    "media_mute": (KEY_TYPE["multimedia"], 0, 0, 0xE2),
+    "volume_up": (KEY_TYPE["multimedia"], 0, 0, 0xE9),
+    "volume_down": (KEY_TYPE["multimedia"], 0, 0, 0xEA),
+    "disabled": (0, 0, 0, 0),
+}
+ACTION_NAMES = list(BUTTON_ACTIONS)
+
+
+class DeviceError(Exception):
+    exit_code = 1
+
+
+class DeviceNotFound(DeviceError):
+    exit_code = 2
+
+
+class PermissionDenied(DeviceError):
+    exit_code = 3
+
+
+class NoReply(DeviceError):
+    exit_code = 4
+
+
+class ProtocolError(DeviceError):
+    exit_code = 5
 
 
 def _ioc(direction: int, nr: int, size: int) -> int:
@@ -91,149 +180,771 @@ def candidates() -> list[tuple[str, str, int, int]]:
     return found
 
 
-def query_once(path: str) -> bytearray | None:
-    """Send the battery query and return a validated 64-byte reply."""
-    fd = os.open(path, os.O_RDWR)
-    try:
-        request = bytearray(FRAME_SIZE)
-        request[0] = REPORT_ID
-        request[1] = 0x20
-        request[2] = 0x50
-        request[5] = 0x4F
-        request[6] = 0x81
-        fcntl.ioctl(fd, HIDIOCSFEATURE, request)
+def build_request(cmd: int, sub: int, data: bytes = b"", encap: int = 0) -> bytes:
+    """Build the 64-byte feature report including report ID and checksum."""
+    if len(data) > 57:
+        raise ValueError("payload too large")
+    request = bytearray(FRAME_SIZE)
+    request[0] = REPORT_ID
+    request[2] = 0x50
+    request[3] = len(data)
+    request[4] = encap & 0xFF
+    request[5] = cmd & 0xFF
+    request[6] = sub & 0xFF
+    request[7 : 7 + len(data)] = data
+    request[1] = sum(request[1:]) & 0xFF
+    return bytes(request)
+
+
+class HidSession:
+    """One open hidraw node with serialized request/response exchanges."""
+
+    def __init__(self, path: str, name: str, vendor: int, product: int):
+        self.path = path
+        self.name = name
+        self.vendor = vendor
+        self.product = product
+        self.fd = os.open(path, os.O_RDWR)
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None  # type: ignore[assignment]
+
+    def __enter__(self) -> "HidSession":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def _exchange(
+        self, cmd: int, sub: int, data: bytes, timeout: float, encap: int = 0
+    ) -> tuple[bytes, bytes]:
+        request = bytearray(build_request(cmd, sub, data, encap))
+
+        try:
+            fcntl.ioctl(self.fd, HIDIOCSFEATURE, request)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EPERM):
+                raise PermissionDenied("permission denied (install the udev rule)") from exc
+            raise
 
         # The receiver needs a moment to stage the answer.
         time.sleep(0.06)
-
-        deadline = time.monotonic() + 0.20
+        deadline = time.monotonic() + timeout
+        last_status = None
         while time.monotonic() < deadline:
             reply = bytearray(FRAME_SIZE)
             reply[0] = REPORT_ID
             try:
-                fcntl.ioctl(fd, HIDIOCGFEATURE, reply)
+                fcntl.ioctl(self.fd, HIDIOCGFEATURE, reply)
             except OSError:
                 time.sleep(0.008)
                 continue
 
-            if (
-                reply[0] == REPORT_ID
-                and reply[1] == 0x50
-                and reply[3] == 0x0B
-                and reply[13] == 0xA5
-                and reply[14] == 0x5A
-            ):
-                return reply
+            if reply[0] != REPORT_ID or reply[1] != 0x50:
+                time.sleep(0.008)
+                continue
+
+            status = reply[2]
+            length = reply[3]
+            if status == 0:
+                if length > 58:
+                    raise ProtocolError(f"reply length {length} is too large")
+                return bytes(reply[6 : 6 + length]), bytes(reply)
+            last_status = status
             time.sleep(0.008)
-        return None
-    finally:
-        os.close(fd)
+
+        if last_status == 2:
+            raise NoReply("mouse asleep or offline")
+        if last_status is not None:
+            raise ProtocolError(f"device returned status {last_status}")
+        raise NoReply("no reply (mouse asleep or out of range)")
+
+    def query(
+        self,
+        cmd: int,
+        sub: int = 0,
+        data: bytes = b"",
+        *,
+        attempts: int = 4,
+        timeout: float = 0.35,
+        encap: int = 0,
+    ) -> tuple[bytes, bytes]:
+        last: DeviceError | None = None
+        for attempt in range(attempts):
+            if attempt:
+                time.sleep(0.12)
+            try:
+                return self._exchange(cmd, sub, data, timeout, encap)
+            except (NoReply, ProtocolError) as exc:
+                last = exc
+        assert last is not None
+        raise last
 
 
-def parse_reply(reply: bytes | bytearray) -> dict:
-    status_byte = reply[6]
-    charging = bool(status_byte & 0x80)
-    level = status_byte & 0x7F
+def find_session() -> HidSession:
+    nodes = candidates()
+    if not nodes:
+        raise DeviceNotFound("EWEADN receiver not found")
 
+    permission_denied = False
+    last_error: OSError | None = None
+    for path, name, vendor, product in nodes:
+        try:
+            return HidSession(path, name, vendor, product)
+        except PermissionError:
+            permission_denied = True
+        except OSError as exc:
+            last_error = exc
+            if exc.errno in (errno.EACCES, errno.EPERM):
+                permission_denied = True
+
+    if permission_denied:
+        raise PermissionDenied("permission denied (install the udev rule)")
+    if last_error is not None:
+        raise DeviceNotFound(f"could not open receiver: {last_error}")
+    raise DeviceNotFound("EWEADN receiver not found")
+
+
+def source_for_product(product: int) -> str:
+    return "USB cable" if product in CABLE_PIDS else "2.4 GHz receiver"
+
+
+def read_chunks(
+    session: HidSession,
+    cmd: int,
+    sub: int,
+    total: int,
+    *,
+    packet_limit: int = 10,
+) -> bytes:
+    """Read a multi-packet feature response (DPI table, key table)."""
+    chunks = max(1, (total + packet_limit - 1) // packet_limit)
+    data = bytearray()
+    for index in range(chunks):
+        try:
+            chunk, _ = session.query(cmd, sub + index, encap=index)
+        except DeviceError:
+            if data:
+                break
+            raise
+        if not chunk:
+            break
+        data.extend(chunk)
+        if len(data) >= total:
+            break
+    return bytes(data[:total])
+
+
+def decode_dpi(raw: int, max_dpi: int) -> int:
+    """Decode the sensor's 16-bit DPI field."""
+    limit = max(0, max_dpi // 50 - 1)
+    if raw <= limit:
+        return (raw + 1) * 50
+    return raw
+
+
+def encode_dpi(dpi: int, max_dpi: int) -> int:
+    """Encode DPI the same way the vendor SDK does."""
+    if dpi <= max_dpi:
+        return max(0, dpi // 50 - 1)
+    return dpi
+
+
+def parse_basics(data: bytes) -> dict:
+    if len(data) < 7:
+        raise ProtocolError(f"basic info reply is only {len(data)} bytes")
+    status = data[0]
+    charging = bool(status & 0x80)
+    level = status & 0x7F
     if charging:
-        # On the cable the vendor firmware returns 0xE4 and the low bits are a
-        # sentinel, not a real level.  Report charging without a fake 100 %.
         percent = None
-    else:
-        if level > 100:
-            raise ValueError(f"invalid battery level 0x{level:02X}")
+    elif level <= 100:
         percent = level
+    else:
+        raise ProtocolError(f"invalid battery level 0x{level:02X}")
 
+    profile_byte = data[1]
     return {
-        "percent": percent,
-        "charging": charging,
-        "status": status_byte,
-        "raw": reply[:16].hex(" "),
+        "battery": {
+            "percent": percent,
+            "charging": charging,
+            "raw": status,
+        },
+        "profile": {
+            "current": profile_byte & 0x0F,
+            "max": (profile_byte >> 4) & 0x0F,
+        },
+        "max_report_code": data[2],
+        "sensor_code": data[3],
+        "max_dpi": data[4] | (data[5] << 8),
+        "macro_size": data[6],
     }
 
 
-def read_battery() -> tuple[dict, int, str | None]:
-    """Try all EWEADN nodes and return (result, exit code, error)."""
-    nodes = candidates()
-    if not nodes:
-        return {}, 2, "EWEADN receiver not found"
+def parse_sensor(data: bytes) -> dict:
+    if len(data) < 6:
+        raise ProtocolError(f"sensor reply is only {len(data)} bytes")
+    flags = data[1]
+    dpi_byte = data[2]
+    return {
+        "sensor_code": data[0],
+        "is_single_adjust": bool(flags & 0x80),
+        "wired_rate_code": (flags >> 4) & 0x07,
+        "wireless_rate_code": flags & 0x07,
+        "current_stage": ((dpi_byte >> 4) & 0x0F) or 1,
+        "stage_count": (dpi_byte & 0x0F) or 6,
+        "lod": data[3],
+        "debounce": data[4],
+        "flags": data[5],
+        "sleep_broadcast": data[6] if len(data) > 6 else None,
+        "sleep_reconnect": data[7] if len(data) > 7 else None,
+        "sleep": data[8] if len(data) > 8 else None,
+        "current_profile": data[9] if len(data) > 9 else None,
+    }
 
-    accessible = False
-    permission_denied = False
-    got_reply = False
-    last_error = "no reply (mouse asleep or out of range)"
 
-    for path, name, _vendor, product in nodes:
-        for attempt in range(4):
-            if attempt:
-                time.sleep(0.14)
-            try:
-                reply = query_once(path)
-                accessible = True
-            except PermissionError:
-                permission_denied = True
-                break
-            except OSError as exc:
-                # The node opened, so this is a transport error rather than a
-                # missing udev rule even if it is EACCES on the ioctl.
-                accessible = True
-                if exc.errno in (errno.EACCES, errno.EPERM):
-                    permission_denied = True
-                    break
-                last_error = f"{type(exc).__name__}: {exc}"
-                continue
+def parse_dpi(data: bytes, max_dpi: int) -> list[dict]:
+    stages: list[dict] = []
+    for index in range(8):
+        value_offset = 1 + index * 2
+        color_offset = 17 + index * 3
+        if value_offset + 1 >= len(data) or color_offset + 2 >= len(data):
+            break
+        raw = data[value_offset] | (data[value_offset + 1] << 8)
+        color = data[color_offset : color_offset + 3]
+        stages.append(
+            {
+                "index": index + 1,
+                "raw": raw,
+                "dpi": decode_dpi(raw, max_dpi),
+                "color": "#{:02x}{:02x}{:02x}".format(*color),
+            }
+        )
+    return stages
 
-            if reply is None:
-                continue
 
-            got_reply = True
-            try:
-                parsed = parse_reply(reply)
-            except ValueError as exc:
-                last_error = str(exc)
-                continue
-
-            parsed.update(
-                {
-                    "ok": True,
-                    "path": path,
-                    "name": name,
-                    "vendor": f"{VID:04x}",
-                    "product": f"{product:04x}",
-                    "source": "USB cable" if product in CABLE_PIDS else "2.4 GHz receiver",
-                }
+def parse_keys(data: bytes) -> list[dict]:
+    keys: list[dict] = []
+    for index in range(5):
+        offset = index * 4
+        if offset + 3 >= len(data):
+            break
+        key_type = data[offset]
+        code1 = data[offset + 1]
+        code2 = data[offset + 2]
+        code3 = data[offset + 3]
+        action = "raw"
+        if key_type == KEY_TYPE["mouse"]:
+            action = MOUSE_CODE_NAME.get(code1, f"mouse_{code1}")
+        elif key_type == KEY_TYPE["dpi"]:
+            action = {1: "dpi_up", 2: "dpi_down", 4: "dpi_loop"}.get(
+                code1, f"dpi_{code1}"
             )
-            return parsed, 0, None
+        elif key_type == KEY_TYPE["profile"]:
+            action = (
+                f"profile_{code1}" if 1 <= code1 <= 4 else "profile_cycle"
+            )
+        elif key_type == KEY_TYPE["multimedia"]:
+            action = {
+                0xCD: "media_play_pause",
+                0xB5: "media_next",
+                0xB6: "media_prev",
+                0xE2: "media_mute",
+                0xE9: "volume_up",
+                0xEA: "volume_down",
+            }.get(code3, f"media_{code3:02x}")
+        elif key_type == KEY_TYPE["macro"]:
+            action = f"macro_{code3}"
+        elif key_type == KEY_TYPE["report"]:
+            action = "report_switch"
+        elif key_type == 0 and code1 == 0 and code2 == 0 and code3 == 0:
+            action = "disabled"
+        elif key_type == KEY_TYPE["keyboard"]:
+            action = "keyboard"
 
-    if not accessible and permission_denied:
-        return {}, 3, "permission denied (install the udev rule)"
-    if got_reply:
-        return {}, 5, last_error
-    return {}, 4, last_error
+        keys.append(
+            {
+                "index": index,
+                "button": BUTTON_NAMES[index],
+                "key_type": key_type,
+                "code1": code1,
+                "code2": code2,
+                "code3": code3,
+                "action": action,
+            }
+        )
+    return keys
+
+
+def read_battery(session: HidSession | None = None) -> tuple[dict, bytes]:
+    own = session is None
+    session = session or find_session()
+    try:
+        data, raw = session.query(0x4F, 0x81)
+        parsed = parse_basics(data)
+        battery = parsed["battery"]
+        result = {
+            "ok": True,
+            "percent": battery["percent"],
+            "charging": battery["charging"],
+            "status": battery["raw"],
+            "path": session.path,
+            "name": session.name,
+            "vendor": f"{session.vendor:04x}",
+            "product": f"{session.product:04x}",
+            "source": source_for_product(session.product),
+            "raw": raw[:16].hex(" "),
+            "battery": battery,
+        }
+        return result, raw
+    finally:
+        if own:
+            session.close()
+
+
+def read_config(session: HidSession | None = None) -> tuple[dict, dict]:
+    own = session is None
+    session = session or find_session()
+    try:
+        basics_data, basics_raw = session.query(0x4F, 0x81)
+        sensor_data, sensor_raw = session.query(0x4F, 0x40)
+        dpi_data = read_chunks(session, 0x4F, 0x41, 64)
+        keys_data = read_chunks(session, 0x4F, 0x00, 48)
+        dpi_raw = dpi_data[:16]
+        keys_raw = keys_data[:16]
+
+        basics = parse_basics(basics_data)
+        sensor = parse_sensor(sensor_data)
+        max_dpi = basics["max_dpi"] or 30000
+        wired = session.product in CABLE_PIDS
+        rate_code = (
+            sensor["wired_rate_code"] if wired else sensor["wireless_rate_code"]
+        )
+
+        config = {
+            "ok": True,
+            "device": {
+                "path": session.path,
+                "name": session.name,
+                "vendor": f"{session.vendor:04x}",
+                "product": f"{session.product:04x}",
+                "source": source_for_product(session.product),
+                "wired": wired,
+            },
+            "battery": basics["battery"],
+            "polling": {
+                "hz": POLLING_RATES.get(rate_code, 1000),
+                "code": rate_code,
+                "is_single_adjust": sensor["is_single_adjust"],
+                "max_report_code": basics["max_report_code"],
+            },
+            "dpi": {
+                "sensor_code": basics["sensor_code"],
+                "max_dpi": max_dpi,
+                "current_stage": sensor["current_stage"],
+                "stage_count": sensor["stage_count"],
+                "stages": parse_dpi(dpi_data, max_dpi),
+            },
+            "buttons": parse_keys(keys_data),
+            "profile": {
+                "current": basics["profile"]["current"],
+                "max": basics["profile"]["max"],
+                "sensor_current": sensor["current_profile"],
+            },
+            "sensor": sensor,
+        }
+        raw = {
+            "basics": basics_raw[:16].hex(" "),
+            "sensor": sensor_raw[:16].hex(" "),
+            "dpi": dpi_raw[:16].hex(" "),
+            "keys": keys_raw[:16].hex(" "),
+        }
+        return config, raw
+    finally:
+        if own:
+            session.close()
+
+
+def backup_path() -> str:
+    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    directory = os.path.join(state, "eweadn-battery", "backups")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return os.path.join(directory, f"eweadn-config-{stamp}.json")
+
+
+def save_backup(config: dict, path: str | None = None) -> str:
+    target = path or backup_path()
+    os.makedirs(os.path.dirname(os.path.abspath(target)), mode=0o700, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    return target
+
+
+def write_and_verify(
+    session: HidSession,
+    cmd: int,
+    sub: int,
+    data: bytes,
+    expected: dict,
+) -> tuple[dict, str]:
+    """Apply a write, tolerate a missing ack, and verify by re-reading."""
+    try:
+        session.query(cmd, sub, data, attempts=2, timeout=0.25)
+    except NoReply:
+        pass
+
+    after, _ = read_config(session)
+    for key, value in expected.items():
+        if key == "polling_hz":
+            actual = after["polling"]["hz"]
+        elif key == "dpi":
+            stage = after["dpi"]["current_stage"]
+            stages = {s["index"]: s for s in after["dpi"]["stages"]}
+            actual = stages.get(stage, {}).get("dpi")
+            value = value.get("dpi") if isinstance(value, dict) else value
+        elif key == "button":
+            index = value["index"]
+            actual = after["buttons"][index]["action"] if index < len(after["buttons"]) else None
+            value = value["action"]
+        else:
+            raise KeyError(key)
+        if actual != value:
+            raise ProtocolError(
+                f"write verification failed for {key}: expected {value!r}, read {actual!r}"
+            )
+    return after, ""
+
+
+def plan_polling(config: dict, hz: int, wired: bool | None) -> tuple[bytes, dict]:
+    if hz not in HZ_TO_CODE:
+        raise ValueError(f"unsupported polling rate {hz}; choose one of {sorted(HZ_TO_CODE)}")
+    use_wired = config["device"]["wired"] if wired is None else wired
+    code = HZ_TO_CODE[hz]
+    value = (code << 4) if use_wired else code
+    if config["polling"]["is_single_adjust"]:
+        value |= 0x80
+    return bytes([value]), {
+        "transport": "wired" if use_wired else "wireless",
+        "hz": hz,
+        "value": value,
+    }
+
+
+def plan_dpi(
+    config: dict,
+    stage: int,
+    dpi: int,
+    stage_count: int | None,
+    color: str | None,
+) -> tuple[bytes, dict]:
+    stage_count = stage_count or config["dpi"]["stage_count"]
+    max_dpi = config["dpi"]["max_dpi"]
+    if not 1 <= stage <= 8:
+        raise ValueError("DPI stage must be between 1 and 8")
+    if not 1 <= stage_count <= 8:
+        raise ValueError("stage count must be between 1 and 8")
+    if stage > stage_count:
+        raise ValueError("active DPI stage is above the stage count")
+    if dpi < 50 or dpi > max_dpi:
+        raise ValueError(f"DPI must be between 50 and {max_dpi}")
+    if dpi % 50:
+        raise ValueError("DPI must be a multiple of 50")
+
+    stages = {s["index"]: s for s in config["dpi"]["stages"]}
+    if stage not in stages and color is None:
+        raise ValueError(f"DPI stage {stage} was not returned by the mouse")
+    stage_color = color or stages[stage]["color"]
+    if not stage_color.startswith("#") or len(stage_color) != 7:
+        raise ValueError("color must be #RRGGBB")
+    try:
+        rgb = bytes.fromhex(stage_color[1:])
+    except ValueError as exc:
+        raise ValueError("color must be #RRGGBB") from exc
+
+    raw = encode_dpi(dpi, max_dpi)
+    combined = ((stage & 0x0F) << 4) | (stage_count & 0x0F)
+    payload = bytes([combined, raw & 0xFF, (raw >> 8) & 0xFF, *rgb])
+    return payload, {
+        "stage": stage,
+        "stage_count": stage_count,
+        "dpi": dpi,
+        "color": stage_color,
+        "raw": raw,
+    }
+
+
+def plan_button(index: int, action: str) -> tuple[int, bytes, dict]:
+    if not 0 <= index <= 4:
+        raise ValueError("button index must be 0-4")
+    if action not in BUTTON_ACTIONS:
+        raise ValueError(f"unknown action {action}; choose one of {', '.join(ACTION_NAMES)}")
+    key_type, code, times, gap = BUTTON_ACTIONS[action]
+    pos = KEY_POS[BUTTON_NAMES[index]]
+    payload = bytes([key_type, code, times, gap])
+    return pos, payload, {
+        "index": index,
+        "button": BUTTON_NAMES[index],
+        "action": action,
+        "key_type": key_type,
+        "code": code,
+        "times": times,
+        "gap": gap,
+    }
+
+
+def emit(value: dict, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(value))
+    else:
+        if value.get("ok"):
+            if "battery" in value and "dpi" not in value:
+                battery = value["battery"]
+                if battery["charging"]:
+                    print(f"{value['name']}: charging")
+                else:
+                    print(f"{value['name']}: {battery['percent']}%")
+            elif "dpi" in value:
+                print_config(value)
+            else:
+                print(json.dumps(value, indent=2, sort_keys=True))
+        else:
+            print(f"eweadn-battery: {value.get('error', 'unknown error')}", file=sys.stderr)
+
+
+def print_config(config: dict) -> None:
+    device = config["device"]
+    battery = config["battery"]
+    polling = config["polling"]
+    dpi = config["dpi"]
+    profile = config["profile"]
+    print(f"{device['name']} on {device['source']}")
+    if battery["charging"]:
+        print("Battery: charging")
+    else:
+        print(f"Battery: {battery['percent']}%")
+    print(f"Polling: {polling['hz']} Hz")
+    print(
+        "DPI: {} / {} stages, current {} DPI".format(
+            len(dpi["stages"]),
+            dpi["stage_count"],
+            next(
+                (
+                    s["dpi"]
+                    for s in dpi["stages"]
+                    if s["index"] == dpi["current_stage"]
+                ),
+                "?",
+            ),
+        )
+    )
+    for stage in dpi["stages"][: dpi["stage_count"]]:
+        marker = "*" if stage["index"] == dpi["current_stage"] else " "
+        print(f"  {marker}{stage['index']}: {stage['dpi']} DPI {stage['color']}")
+    print(f"Profile: {profile['current']} of {profile['max']}")
+    for key in config["buttons"]:
+        print(f"  {key['button']}: {key['action']}")
+
+
+def command_config(args: argparse.Namespace, as_json: bool) -> int:
+    config, raw = read_config()
+    if args.debug:
+        config["raw"] = raw
+    emit(config, as_json)
+    return 0
+
+
+def command_backup(args: argparse.Namespace, as_json: bool) -> int:
+    config, _ = read_config()
+    path = save_backup(config, args.output)
+    result = {"ok": True, "path": path, "config": config}
+    emit(result, as_json)
+    return 0
+
+
+def command_set_polling(args: argparse.Namespace, as_json: bool) -> int:
+    session = find_session()
+    try:
+        config, _ = read_config(session)
+        payload, plan = plan_polling(config, args.hz, args.wired if args.wired else None)
+        if not args.apply:
+            emit({"ok": True, "dry_run": True, "before": config, "plan": plan}, as_json)
+            return 0
+        path = save_backup(config, args.backup)
+        after, _ = write_and_verify(
+            session,
+            0x35,
+            0x01,
+            payload,
+            {"polling_hz": args.hz},
+        )
+        emit(
+            {
+                "ok": True,
+                "applied": True,
+                "backup": path,
+                "plan": plan,
+                "after": after,
+            },
+            as_json,
+        )
+        return 0
+    finally:
+        session.close()
+
+
+def command_set_dpi(args: argparse.Namespace, as_json: bool) -> int:
+    session = find_session()
+    try:
+        config, _ = read_config(session)
+        payload, plan = plan_dpi(
+            config, args.stage, args.dpi, args.stage_count, args.color
+        )
+        if not args.apply:
+            emit({"ok": True, "dry_run": True, "before": config, "plan": plan}, as_json)
+            return 0
+        path = save_backup(config, args.backup)
+        after, _ = write_and_verify(
+            session,
+            0x3A,
+            0x00,
+            payload,
+            {"dpi": {"dpi": args.dpi}},
+        )
+        emit(
+            {
+                "ok": True,
+                "applied": True,
+                "backup": path,
+                "plan": plan,
+                "after": after,
+            },
+            as_json,
+        )
+        return 0
+    finally:
+        session.close()
+
+
+def command_set_button(args: argparse.Namespace, as_json: bool) -> int:
+    session = find_session()
+    try:
+        config, _ = read_config(session)
+        if args.button not in BUTTON_NAMES:
+            raise ValueError(f"button must be one of {', '.join(BUTTON_NAMES)}")
+        index = BUTTON_NAMES.index(args.button)
+        pos, payload, plan = plan_button(index, args.action)
+        if not args.apply:
+            emit({"ok": True, "dry_run": True, "before": config, "plan": plan}, as_json)
+            return 0
+        path = save_backup(config, args.backup)
+        after, _ = write_and_verify(
+            session,
+            0x30,
+            pos,
+            payload,
+            {"button": {"index": index, "action": args.action}},
+        )
+        emit(
+            {
+                "ok": True,
+                "applied": True,
+                "backup": path,
+                "plan": plan,
+                "after": after,
+            },
+            as_json,
+        )
+        return 0
+    finally:
+        session.close()
+
+
+def command_battery(as_json: bool) -> int:
+    result, _ = read_battery()
+    emit(result, as_json)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Battery and settings helper for EWEADN S9 mice"
+    )
+    parser.add_argument("--json", action="store_true", dest="json_global")
+    sub = parser.add_subparsers(dest="command")
+
+    battery = sub.add_parser("battery", help="read battery (default)")
+    battery.add_argument("--json", action="store_true", dest="json_sub")
+
+    config = sub.add_parser("config", help="read polling, DPI, buttons and profile")
+    config.add_argument("--json", action="store_true", dest="json_sub")
+    config.add_argument("--debug", action="store_true")
+
+    backup = sub.add_parser("backup", help="save a JSON configuration backup")
+    backup.add_argument("--json", action="store_true", dest="json_sub")
+    backup.add_argument("--output")
+
+    polling = sub.add_parser("set-polling", help="set the polling rate")
+    polling.add_argument("hz", type=int)
+    polling.add_argument("--wired", action="store_true")
+    polling.add_argument("--apply", action="store_true")
+    polling.add_argument("--backup")
+    polling.add_argument("--json", action="store_true", dest="json_sub")
+
+    dpi = sub.add_parser("set-dpi", help="set a DPI stage")
+    dpi.add_argument("stage", type=int)
+    dpi.add_argument("dpi", type=int)
+    dpi.add_argument("--stage-count", type=int)
+    dpi.add_argument("--color")
+    dpi.add_argument("--apply", action="store_true")
+    dpi.add_argument("--backup")
+    dpi.add_argument("--json", action="store_true", dest="json_sub")
+
+    button = sub.add_parser("set-button", help="remap one mouse button")
+    button.add_argument("button", choices=BUTTON_NAMES)
+    button.add_argument("action", choices=ACTION_NAMES)
+    button.add_argument("--apply", action="store_true")
+    button.add_argument("--backup")
+    button.add_argument("--json", action="store_true", dest="json_sub")
+
+    return parser
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Read EWEADN S9 mouse battery")
-    parser.add_argument("--json", action="store_true", help="print JSON")
+    parser = build_parser()
     args = parser.parse_args()
+    as_json = bool(args.json_global or getattr(args, "json_sub", False))
 
-    result, code, error = read_battery()
-
-    if args.json:
-        if code == 0:
-            print(json.dumps(result))
+    try:
+        if args.command in (None, "battery"):
+            return command_battery(as_json)
+        if args.command == "config":
+            return command_config(args, as_json)
+        if args.command == "backup":
+            return command_backup(args, as_json)
+        if args.command == "set-polling":
+            return command_set_polling(args, as_json)
+        if args.command == "set-dpi":
+            return command_set_dpi(args, as_json)
+        if args.command == "set-button":
+            return command_set_button(args, as_json)
+        parser.error("unknown command")
+    except DeviceError as exc:
+        if as_json:
+            print(json.dumps({"ok": False, "error": str(exc)}))
         else:
-            print(json.dumps({"ok": False, "error": error}))
-    else:
-        if code == 0:
-            if result["charging"]:
-                print(f"{result['name']}: charging")
-            else:
-                print(f"{result['name']}: {result['percent']}%")
+            print(f"eweadn-battery: {exc}", file=sys.stderr)
+        return exc.exit_code
+    except ValueError as exc:
+        if as_json:
+            print(json.dumps({"ok": False, "error": str(exc)}))
         else:
-            print(f"eweadn-battery: {error}", file=sys.stderr)
-
-    return code
+            print(f"eweadn-battery: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
