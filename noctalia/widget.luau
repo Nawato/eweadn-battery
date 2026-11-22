@@ -97,7 +97,7 @@ local function render(battery)
 	barWidget.setTooltip({
 		{ key = "Mouse", value = "EWEADN S9" },
 		{ key = "Battery", value = status },
-		{ key = "Link", value = "2.4 GHz receiver" },
+		{ key = "Link", value = battery.source or "2.4 GHz receiver" },
 		{ key = "Updated", value = relativeTime(battery.ts) },
 	})
 end

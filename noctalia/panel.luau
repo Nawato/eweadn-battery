@@ -88,6 +88,14 @@ local function reset_drafts()
 	if config == nil then
 		return
 	end
+	if config.polling == nil or config.dpi == nil then
+		draft_polling = 4
+		draft_stage = 1
+		draft_dpi = 800
+		draft_buttons = {}
+		draft_button_known = {}
+		return
+	end
 
 	local polling = config.polling.hz or 1000
 	draft_polling = 1
@@ -462,7 +470,7 @@ local function build_status()
 	local percent = battery.percent
 	local battery_text = charging and "Charging" or (percent ~= nil and string.format("%d%%", percent) or "Unknown")
 
-	return ui.column({ gap = 8, align = "stretch" }, {
+	local rows = {
 		ui.row({ gap = 12, align = "center" }, {
 			ui.glyph({
 				name = main_icon(percent, charging),
@@ -481,10 +489,19 @@ local function build_status()
 			}),
 		}),
 		ui.separator({ spacing = 2 }),
-		status_row("Polling", string.format("%d Hz", config.polling.hz)),
-		status_row("DPI", string.format("%d DPI", current_stage_dpi(config.dpi.current_stage))),
-		status_row("Profile", profile_text(), "primary"),
-	})
+	}
+
+	if config.polling then
+		table.insert(rows, status_row("Polling", string.format("%d Hz", config.polling.hz)))
+	end
+	if config.dpi then
+		table.insert(rows, status_row("DPI", string.format("%d DPI", current_stage_dpi(config.dpi.current_stage))))
+	end
+	if config.profile and (tonumber(config.profile.max) or 0) > 0 then
+		table.insert(rows, status_row("Profile", profile_text(), "primary"))
+	end
+
+	return ui.column({ gap = 8, align = "stretch" }, rows)
 end
 
 render = function()
@@ -526,22 +543,35 @@ render = function()
 	end
 
 	table.insert(content, ui.separator({ spacing = 4 }))
-	table.insert(content, build_polling())
-	table.insert(content, build_dpi())
-	table.insert(content, build_buttons())
-	table.insert(content, section("Profiles", ui.column({ gap = 6, align = "stretch" }, {
-		ui.label({ text = profile_text(), fontWeight = "medium" }),
-		ui.label({
-			text = "The S9 firmware has no direct profile-switch command. Use the onboard profile button or bind a button to Profile 1-4 or Profile cycle above.",
+
+	if config.settings_available == false then
+		table.insert(content, section("Settings", ui.label({
+			text = "Settings are unavailable over Bluetooth. Use the 2.4 GHz receiver or the USB cable for polling, DPI, and button changes.",
+			color = "on_surface_variant",
+		})))
+		table.insert(content, ui.label({
+			text = "Battery monitoring still works over Bluetooth through BlueZ.",
 			color = "on_surface_variant",
 			fontSize = 12,
-		}),
-	})))
-	table.insert(content, ui.label({
-		text = "Changes are written to onboard memory. A backup is saved before every write.",
-		color = "on_surface_variant",
-		fontSize = 12,
-	}))
+		}))
+	else
+		table.insert(content, build_polling())
+		table.insert(content, build_dpi())
+		table.insert(content, build_buttons())
+		table.insert(content, section("Profiles", ui.column({ gap = 6, align = "stretch" }, {
+			ui.label({ text = profile_text(), fontWeight = "medium" }),
+			ui.label({
+				text = "The S9 firmware has no direct profile-switch command. Use the onboard profile button or bind a button to Profile 1-4 or Profile cycle above.",
+				color = "on_surface_variant",
+				fontSize = 12,
+			}),
+		})))
+		table.insert(content, ui.label({
+			text = "Changes are written to onboard memory. A backup is saved before every write.",
+			color = "on_surface_variant",
+			fontSize = 12,
+		}))
+	end
 
 	local scrolled = {}
 	for i = 3, #content do

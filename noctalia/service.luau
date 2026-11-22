@@ -29,6 +29,7 @@ local function setError(message)
 			charging = last.charging,
 			ts = last.ts,
 			error = message,
+			source = last.source,
 		}
 	end
 	publish()
@@ -62,6 +63,7 @@ local function poll()
 				charging = charging,
 				ts = noctalia.nowMs(),
 				error = nil,
+				source = data.source or "2.4 GHz receiver",
 			}
 
 			if charging then
