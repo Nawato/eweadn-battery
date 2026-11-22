@@ -257,7 +257,8 @@ Every applied write saves the current configuration first and reads it back
 afterwards. Verification compares the exact fields the write intended to
 change: the polling rate code for the active transport, the DPI stage value
 and color plus stage count, and the button raw bytes. `restore` also verifies
-the active DPI stage.
+the active DPI stage and uses the backup's saved wired/wireless polling
+transport.
 
 Backups are written atomically with mode `0600`. Automatic backups live in a
 private `0700` directory under `$XDG_STATE_HOME/eweadn-battery/backups/`
