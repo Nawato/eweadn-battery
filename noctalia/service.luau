@@ -9,18 +9,76 @@ local LOW_PERCENT = 15
 
 local last = nil
 local pending = false
+local refresh_queued = false
 local lowNotified = false
+local started_at = noctalia.nowMs()
+local first_update = true
+
+local function trim(value)
+	if type(value) ~= "string" then
+		return ""
+	end
+	local trimmed = noctalia.string.trim(value)
+	if type(trimmed) ~= "string" then
+		return ""
+	end
+	return trimmed
+end
+
+local function decode(value)
+	local text = trim(value)
+	if text == "" then
+		return nil
+	end
+	local ok, parsed = pcall(noctalia.json.decode, text)
+	if ok and type(parsed) == "table" then
+		return parsed
+	end
+	return nil
+end
+
+local function result_error(data, result, fallback)
+	if type(data) == "table" then
+		local message = trim(data.error)
+		if message ~= "" then
+			return message
+		end
+	end
+
+	local stderr = trim(result and result.stderr)
+	if result and result.timedOut == true then
+		if stderr ~= "" then
+			return "helper timed out: " .. stderr
+		end
+		return "helper timed out"
+	end
+	if stderr ~= "" then
+		return stderr
+	end
+
+	local exit_code = result and tonumber(result.exitCode)
+	if exit_code ~= nil and exit_code ~= 0 then
+		return string.format("helper exited with code %d", math.floor(exit_code))
+	end
+
+	return fallback
+end
 
 local function publish()
 	noctalia.state.set("battery", last)
 end
 
 local function setError(message)
+	message = trim(message)
+	if message == "" then
+		message = "could not read mouse battery"
+	end
+
 	if last == nil then
 		last = {
 			percent = nil,
 			charging = false,
-			ts = noctalia.nowMs(),
+			ts = nil,
 			error = message,
 		}
 	else
@@ -35,8 +93,12 @@ local function setError(message)
 	publish()
 end
 
-local function poll()
+local poll
+
+poll = function()
 	if pending then
+		-- A forced refresh must not be dropped just because a poll is running.
+		refresh_queued = true
 		return
 	end
 	pending = true
@@ -44,12 +106,9 @@ local function poll()
 	local accepted = noctalia.runAsync({ "python3", HELPER, "--json" }, function(result)
 		pending = false
 
-		local data = nil
-		if result and result.stdout and result.stdout ~= "" then
-			data = noctalia.json.decode(result.stdout)
-		end
+		local data = decode(result and result.stdout)
 
-		if result and result.exitCode == 0 and data and data.ok then
+		if result and result.exitCode == 0 and data and data.ok == true then
 			local percent = data.percent
 			if type(percent) == "number" then
 				percent = math.floor(percent + 0.5)
@@ -57,16 +116,20 @@ local function poll()
 				percent = nil
 			end
 
-			local charging = data.charging == true
+			local source = trim(data.source)
+			if source == "" then
+				source = "2.4 GHz receiver"
+			end
+
 			last = {
 				percent = percent,
-				charging = charging,
+				charging = data.charging == true,
 				ts = noctalia.nowMs(),
 				error = nil,
-				source = data.source or "2.4 GHz receiver",
+				source = source,
 			}
 
-			if charging then
+			if last.charging then
 				lowNotified = false
 			elseif percent ~= nil then
 				if percent <= LOW_PERCENT then
@@ -84,21 +147,26 @@ local function poll()
 
 			publish()
 		else
-			local message = "no reply"
-			if data and data.error then
-				message = data.error
-			elseif result and result.stderr and result.stderr ~= "" then
-				message = noctalia.string.trim(result.stderr)
-			end
-			setError(message)
+			setError(result_error(data, result, "no reply from helper"))
+		end
+
+		if refresh_queued then
+			refresh_queued = false
+			poll()
 		end
 	end)
 
 	if not accepted then
 		pending = false
 		setError("could not start helper")
+		if refresh_queued then
+			refresh_queued = false
+			poll()
+		end
 	end
 end
+
+noctalia.setUpdateInterval(POLL_MS)
 
 noctalia.state.watch("refresh", function()
 	poll()
@@ -107,7 +175,14 @@ end)
 poll()
 
 function update()
-	noctalia.setUpdateInterval(POLL_MS)
+	-- Noctalia invokes update() once immediately after the chunk loads. The
+	-- top-level poll already covers startup, so skip only that duplicate.
+	if first_update then
+		first_update = false
+		if noctalia.nowMs() - started_at < 5000 then
+			return
+		end
+	end
 	poll()
 end
 

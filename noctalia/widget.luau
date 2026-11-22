@@ -2,13 +2,13 @@
 -- Bar widget for the battery value published by service.luau.
 
 local function glyphFor(percent, charging, error)
+	if error ~= nil then
+		return "battery-exclamation"
+	end
 	if charging then
 		return "battery-charging"
 	end
 	if percent == nil then
-		if error ~= nil then
-			return "battery-exclamation"
-		end
 		return "battery-off"
 	end
 	if percent >= 90 then
@@ -50,15 +50,29 @@ local function render(battery)
 		return
 	end
 
-	local percent = battery.percent
+	local percent = tonumber(battery.percent)
+	if percent ~= nil then
+		percent = math.floor(percent)
+	end
 	local charging = battery.charging == true
 	local error = battery.error
+	if type(error) == "string" then
+		error = noctalia.string.trim(error)
+	end
+	if type(error) ~= "string" or error == "" then
+		error = nil
+	end
 
 	barWidget.setGlyph(glyphFor(percent, charging, error))
 
 	if charging then
-		barWidget.setText("Charging")
-		barWidget.setColor("primary")
+		if error ~= nil then
+			barWidget.setText("Charging?")
+			barWidget.setColor("secondary")
+		else
+			barWidget.setText("Charging")
+			barWidget.setColor("primary")
+		end
 	elseif percent ~= nil then
 		if error ~= nil then
 			barWidget.setText(string.format("%d%%?", percent))
@@ -77,29 +91,34 @@ local function render(battery)
 		end
 	else
 		barWidget.setText("--")
-		barWidget.setColor("on_surface")
+		barWidget.setColor(error ~= nil and "secondary" or "on_surface")
 	end
 
 	local status
 	if charging then
-		status = "charging (level not reported)"
-	elseif error ~= nil then
-		status = error
-		if percent ~= nil then
-			status = string.format("%d%% · %s", percent, error)
+		if error ~= nil then
+			status = "charging? (last reading may be stale)"
+		elseif percent ~= nil then
+			status = string.format("charging at %d%%", percent)
+		else
+			status = "charging (level not reported)"
 		end
 	elseif percent ~= nil then
-		status = "discharging"
+		status = error ~= nil and string.format("%d%% (stale)", percent) or "discharging"
 	else
 		status = "unknown"
 	end
 
-	barWidget.setTooltip({
+	local tooltip = {
 		{ key = "Mouse", value = "EWEADN S9" },
 		{ key = "Battery", value = status },
 		{ key = "Link", value = battery.source or "2.4 GHz receiver" },
 		{ key = "Updated", value = relativeTime(battery.ts) },
-	})
+	}
+	if error ~= nil then
+		table.insert(tooltip, { key = "Error", value = error })
+	end
+	barWidget.setTooltip(tooltip)
 end
 
 noctalia.state.watch("battery", render)
