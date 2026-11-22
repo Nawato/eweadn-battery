@@ -3,7 +3,8 @@ set -euo pipefail
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
-bin_home="${XDG_BIN_HOME:-$HOME/.local/bin}"
+# The Noctalia service resolves ~/.local/bin/eweadn-battery directly.
+bin_home="$HOME/.local/bin"
 plugin_dir="$data_home/noctalia/plugins/eweadn-battery"
 
 install -Dm755 "$repo_dir/bin/eweadn-battery" "$bin_home/eweadn-battery"
