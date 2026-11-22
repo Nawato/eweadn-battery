@@ -28,9 +28,10 @@ Profile switching is read-only on the S9 (see below).
 | Other S9-family receivers | `372e:1033`, `372e:1055`, `372e:105e` | 2.4 GHz |
 | EWEADN S9 Ultra cable | `372e:1027` | USB |
 
-The protocol is confirmed on `372e:1026` and `372e:103d`. Other receiver IDs
-are included because they share the same S9 protocol, but they have not all
-been tested.
+The protocol is confirmed on `372e:1026`, `372e:1027` and `372e:103d`. Other
+receiver IDs are included because they share the same S9 protocol, but they
+have not all been tested. Battery, polling, DPI, button writes and profile
+reads were verified on `372e:1027` (cable) and `372e:1026` (receiver).
 
 The bundled udev rule matches `372e:1026` (the 8K receiver) and `372e:1027`
 (USB-cable mode). If you use a different receiver, add its ID from `lsusb` to
