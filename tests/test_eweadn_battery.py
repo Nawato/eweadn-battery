@@ -215,6 +215,59 @@ class ReadConfigTest(unittest.TestCase):
         self.assertEqual(config["profile"], {"current": 1, "max": 2, "sensor_current": 1})
 
 
+class BluetoothTest(unittest.TestCase):
+    MAC = "AA:BB:CC:DD:EE:FF"
+    DEVICES = (
+        f"Device {MAC} EWEADN S9\n"
+        "Device 11:22:33:44:55:66 Keyboard\n"
+    )
+    INFO = (
+        f"Device {MAC}\n"
+        "  Name: EWEADN S9\n"
+        "  Connected: yes\n"
+        "  Battery Percentage: 0x4b (75)\n"
+    )
+
+    def test_parse_devices(self) -> None:
+        devices = module.parse_bluetooth_devices(self.DEVICES)
+        self.assertEqual(devices, [(self.MAC, "EWEADN S9"), ("11:22:33:44:55:66", "Keyboard")])
+
+    def test_parse_info(self) -> None:
+        info = module.parse_bluetooth_info(self.INFO)
+        self.assertTrue(info["connected"])
+        self.assertEqual(info["percent"], 75)
+        self.assertEqual(info["name"], "EWEADN S9")
+
+    def test_read_bluetooth_battery(self) -> None:
+        def fake_bluetoothctl(*args):
+            if args == ("devices",):
+                return self.DEVICES
+            if args == ("info", self.MAC):
+                return self.INFO
+            raise AssertionError(args)
+
+        with mock.patch.object(module, "bluetoothctl", side_effect=fake_bluetoothctl):
+            result = module.read_bluetooth_battery()
+        self.assertEqual(result["percent"], 75)
+        self.assertEqual(result["source"], "Bluetooth")
+        self.assertFalse(result["charging_known"])
+
+    def test_read_battery_falls_back_to_bluetooth(self) -> None:
+        bt = {
+            "ok": True,
+            "percent": 75,
+            "charging": False,
+            "source": "Bluetooth",
+            "battery": {"percent": 75, "charging": False, "raw": None},
+        }
+        with mock.patch.object(
+            module, "find_session", side_effect=module.DeviceNotFound("no usb")
+        ), mock.patch.object(module, "read_bluetooth_battery", return_value=bt):
+            result, _ = module.read_battery()
+        self.assertEqual(result["source"], "Bluetooth")
+        self.assertEqual(result["percent"], 75)
+
+
 class PlanWriteTest(unittest.TestCase):
     def test_wireless_polling(self) -> None:
         payload, plan = module.plan_polling(CONFIG, 8000, None)

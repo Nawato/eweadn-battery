@@ -29,6 +29,8 @@ import fcntl
 import glob
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -510,30 +512,160 @@ def parse_keys(data: bytes) -> list[dict]:
     return keys
 
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+BT_NAME_MATCHES = ("eweadn", "s9")
+
+
+def bluetoothctl(*args: str) -> str:
+    try:
+        result = subprocess.run(
+            ["bluetoothctl", *args],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise DeviceNotFound("bluetoothctl is not installed") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise NoReply("Bluetooth query timed out") from exc
+    return ANSI_RE.sub("", result.stdout + "\n" + result.stderr)
+
+
+def parse_bluetooth_devices(text: str) -> list[tuple[str, str]]:
+    devices: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        match = re.match(r"Device\s+([0-9A-Fa-f:]{17})\s+(.+)", line.strip())
+        if match:
+            devices.append((match.group(1), match.group(2).strip()))
+    return devices
+
+
+def parse_bluetooth_info(text: str) -> dict:
+    percent = None
+    matches = re.findall(
+        r"Battery Percentage:\s+(?:0x[0-9A-Fa-f]+\s+)?\((\d+)\)", text
+    )
+    if not matches:
+        matches = re.findall(r"Battery Percentage:\s+(\d+)%?", text)
+    if matches:
+        value = int(matches[-1])
+        if 0 <= value <= 100:
+            percent = value
+
+    connected = bool(re.search(r"^\s*Connected:\s+yes\s*$", text, re.MULTILINE))
+    name_match = re.search(r"^\s*Name:\s+(.+)$", text, re.MULTILINE)
+    return {
+        "connected": connected,
+        "percent": percent,
+        "name": name_match.group(1).strip() if name_match else None,
+    }
+
+
+def read_bluetooth_battery() -> dict:
+    devices = parse_bluetooth_devices(bluetoothctl("devices"))
+    candidates = [
+        (mac, name)
+        for mac, name in devices
+        if any(term in name.lower() for term in BT_NAME_MATCHES)
+    ]
+    if not candidates:
+        raise DeviceNotFound("no paired EWEADN Bluetooth device")
+
+    for mac, advertised_name in candidates:
+        info = parse_bluetooth_info(bluetoothctl("info", mac))
+        if not info["connected"] or info["percent"] is None:
+            continue
+        name = info["name"] or advertised_name
+        return {
+            "ok": True,
+            "percent": info["percent"],
+            "charging": False,
+            "charging_known": False,
+            "status": None,
+            "path": mac,
+            "name": name,
+            "vendor": "",
+            "product": "",
+            "source": "Bluetooth",
+            "raw": f"battery={info['percent']}",
+            "battery": {
+                "percent": info["percent"],
+                "charging": False,
+                "raw": None,
+            },
+        }
+
+    raise DeviceNotFound(
+        "EWEADN Bluetooth device is not connected or exposes no battery level"
+    )
+
+
+def bluetooth_config() -> tuple[dict, dict]:
+    battery = read_bluetooth_battery()
+    config = {
+        "ok": True,
+        "settings_available": False,
+        "device": {
+            "path": battery["path"],
+            "name": battery["name"],
+            "vendor": "",
+            "product": "",
+            "source": "Bluetooth",
+            "wired": False,
+            "bluetooth": True,
+        },
+        "battery": battery["battery"],
+        "polling": None,
+        "dpi": None,
+        "buttons": [],
+        "profile": {"current": 0, "max": 0, "sensor_current": None},
+        "sensor": {},
+    }
+    return config, {"bluetooth": battery["raw"]}
+
+
 def read_battery(session: HidSession | None = None) -> tuple[dict, bytes]:
     own = session is None
-    session = session or find_session()
+    usb_error: DeviceError | None = None
+
+    if session is None:
+        try:
+            session = find_session()
+        except DeviceError as exc:
+            usb_error = exc
+
+    if session is not None:
+        try:
+            data, raw = session.query(0x4F, 0x81)
+            parsed = parse_basics(data)
+            battery = parsed["battery"]
+            result = {
+                "ok": True,
+                "percent": battery["percent"],
+                "charging": battery["charging"],
+                "status": battery["raw"],
+                "path": session.path,
+                "name": session.name,
+                "vendor": f"{session.vendor:04x}",
+                "product": f"{session.product:04x}",
+                "source": source_for_product(session.product),
+                "raw": raw[:16].hex(" "),
+                "battery": battery,
+            }
+            return result, raw
+        except DeviceError as exc:
+            usb_error = exc
+        finally:
+            if own:
+                session.close()
+
     try:
-        data, raw = session.query(0x4F, 0x81)
-        parsed = parse_basics(data)
-        battery = parsed["battery"]
-        result = {
-            "ok": True,
-            "percent": battery["percent"],
-            "charging": battery["charging"],
-            "status": battery["raw"],
-            "path": session.path,
-            "name": session.name,
-            "vendor": f"{session.vendor:04x}",
-            "product": f"{session.product:04x}",
-            "source": source_for_product(session.product),
-            "raw": raw[:16].hex(" "),
-            "battery": battery,
-        }
-        return result, raw
-    finally:
-        if own:
-            session.close()
+        return read_bluetooth_battery(), b""
+    except DeviceError:
+        if usb_error is not None:
+            raise usb_error
+        raise
 
 
 def read_config(session: HidSession | None = None) -> tuple[dict, dict]:
@@ -760,14 +892,19 @@ def emit(value: dict, as_json: bool) -> None:
 def print_config(config: dict) -> None:
     device = config["device"]
     battery = config["battery"]
-    polling = config["polling"]
-    dpi = config["dpi"]
-    profile = config["profile"]
     print(f"{device['name']} on {device['source']}")
     if battery["charging"]:
         print("Battery: charging")
     else:
         print(f"Battery: {battery['percent']}%")
+
+    if not config.get("settings_available", True):
+        print("Settings: unavailable over Bluetooth (battery only)")
+        return
+
+    polling = config["polling"]
+    dpi = config["dpi"]
+    profile = config["profile"]
     print(f"Polling: {polling['hz']} Hz")
     print(
         "DPI: {} / {} stages, current {} DPI".format(
@@ -792,7 +929,13 @@ def print_config(config: dict) -> None:
 
 
 def command_config(args: argparse.Namespace, as_json: bool) -> int:
-    config, raw = read_config()
+    try:
+        config, raw = read_config()
+    except DeviceError as usb_error:
+        try:
+            config, raw = bluetooth_config()
+        except DeviceError:
+            raise usb_error
     if args.debug:
         config["raw"] = raw
     emit(config, as_json)
