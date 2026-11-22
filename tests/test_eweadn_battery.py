@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import pathlib
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 HELPER = ROOT / "bin" / "eweadn-battery"
@@ -137,6 +138,64 @@ class ParseConfigTest(unittest.TestCase):
         self.assertEqual(keys[2]["action"], "dpi_loop")
         self.assertEqual(keys[3]["action"], "profile_cycle")
         self.assertEqual(keys[4]["action"], "disabled")
+
+
+class ReadConfigTest(unittest.TestCase):
+    class FakeSession:
+        path = "/dev/hidraw9"
+        name = "Gaming Mouse 8K EWEADN S9"
+        vendor = 0x372E
+        product = 0x1026
+        closed = False
+
+        def __init__(self):
+            self.dpi = bytearray(64)
+            for index, raw in enumerate([15, 31, 47, 63, 127, 255]):
+                self.dpi[1 + index * 2] = raw & 0xFF
+                self.dpi[2 + index * 2] = 0
+                self.dpi[17 + index * 3 : 20 + index * 3] = bytes(
+                    [index * 20, 255 - index * 20, 128]
+                )
+            self.keys = bytes(
+                [
+                    1, 1, 1, 0,
+                    1, 2, 1, 0,
+                    1, 3, 1, 0,
+                    5, 4, 1, 0,
+                    0, 0, 0, 0,
+                ]
+            )
+
+        def query(self, cmd, sub, data=b"", encap=0, **_kwargs):
+            if cmd == 0x4F and sub == 0x81:
+                return bytes.fromhex("64 21 07 02 30 75 04 a5 5a 00 00"), b""
+            if cmd == 0x4F and sub == 0x40:
+                return bytes.fromhex("02 66 36 01 03 40 20 10 01 01 00"), b""
+            if cmd == 0x4F and 0x41 <= sub <= 0x47:
+                start = encap * 11
+                return bytes(self.dpi[start : start + 11]), b""
+            if cmd == 0x4F and 0 <= sub <= 4:
+                start = encap * 11
+                return self.keys[start : start + 11], b""
+            raise AssertionError((cmd, sub, encap))
+
+        def close(self):
+            self.closed = True
+
+    def test_full_config_parses_chunked_tables(self) -> None:
+        fake = self.FakeSession()
+        with mock.patch.object(module, "find_session", return_value=fake):
+            config, _ = module.read_config()
+        self.assertTrue(fake.closed)
+        self.assertEqual(config["polling"]["hz"], 2000)
+        self.assertEqual(config["dpi"]["current_stage"], 3)
+        self.assertEqual(config["dpi"]["max_dpi"], 30000)
+        self.assertEqual(len(config["dpi"]["stages"]), 8)
+        self.assertEqual(config["dpi"]["stages"][0]["dpi"], 800)
+        self.assertEqual(len(config["buttons"]), 5)
+        self.assertEqual(config["buttons"][3]["action"], "dpi_loop")
+        self.assertEqual(config["buttons"][4]["action"], "disabled")
+        self.assertEqual(config["profile"], {"current": 1, "max": 2, "sensor_current": 1})
 
 
 class PlanWriteTest(unittest.TestCase):
