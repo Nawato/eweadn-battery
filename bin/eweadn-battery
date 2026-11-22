@@ -16,6 +16,7 @@ New commands:
     eweadn-battery set-dpi 1 1600 --apply
     eweadn-battery set-button back dpi_loop --apply
     eweadn-battery backup
+    eweadn-battery restore --backup FILE --apply
 
 Writes are dry-run unless --apply is passed.  Every applied write saves the
 current configuration first and reads it back afterwards.
@@ -30,8 +31,11 @@ import glob
 import json
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 
@@ -45,10 +49,21 @@ KNOWN_PIDS = {
     0x105E,  # S9 Max / Ultra receiver
 }
 CABLE_PIDS = {0x1027}
+PRODUCT_NAMES = {
+    0x1026: "EWEADN S9 8K receiver",
+    0x1027: "EWEADN S9 USB cable",
+    0x1033: "EWEADN S9 1K receiver",
+    0x103D: "EWEADN S9 Pro 1K receiver",
+    0x1055: "EWEADN S9 Max receiver",
+    0x105E: "EWEADN S9 Ultra receiver",
+}
 
+SYSFS_HIDRAW = "/sys/class/hidraw"
 REPORT_ID = 0x03
 FRAME_SIZE = 64
-HID_NAME_MATCH = "eweadn"
+DPI_TABLE_SIZE = 64
+KEY_TABLE_SIZE = 48
+BACKUP_SIZE_LIMIT = 1 << 20
 
 POLLING_RATES = {
     0: 1000,
@@ -114,9 +129,27 @@ BUTTON_ACTIONS = {
 }
 ACTION_NAMES = list(BUTTON_ACTIONS)
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+COLOR_RE = re.compile(r"#[0-9A-Fa-f]{6}")
+MAC_RE = re.compile(r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}")
+BT_NAME_TERMS = ("eweadn",)
+BATTERY_PERCENT_RE = re.compile(
+    r"Battery Percentage:\s+(?:0x[0-9A-Fa-f]+\s+)?"
+    r"(?:\((\d{1,3})\)|(\d{1,3})\s*%?)"
+)
+LOCK_TIMEOUT = 1.5
+LOCK_RETRY = 0.05
+
 
 class DeviceError(Exception):
     exit_code = 1
+
+    def __init__(self, message: str, *, backup: str | None = None) -> None:
+        if backup and backup not in message:
+            message = f"{message} (backup: {backup})"
+        super().__init__(message)
+        self.backup = backup
 
 
 class DeviceNotFound(DeviceError):
@@ -135,6 +168,18 @@ class ProtocolError(DeviceError):
     exit_code = 5
 
 
+class LockError(DeviceError):
+    pass
+
+
+class BackupError(DeviceError):
+    pass
+
+
+class RestoreError(DeviceError):
+    pass
+
+
 def _ioc(direction: int, nr: int, size: int) -> int:
     return (direction << 30) | (size << 16) | (ord("H") << 8) | nr
 
@@ -143,10 +188,104 @@ HIDIOCSFEATURE = _ioc(3, 0x06, FRAME_SIZE)  # _IOWR('H', 0x06, 64)
 HIDIOCGFEATURE = _ioc(3, 0x07, FRAME_SIZE)  # _IOWR('H', 0x07, 64)
 
 
-def candidates() -> list[tuple[str, str, int, int]]:
-    """Return (device path, HID name, vendor, product) for EWEADN nodes."""
+def map_os_error(exc: OSError, context: str) -> DeviceError:
+    """Translate expected kernel errors into the CLI failure contract."""
+    if exc.errno in (errno.EACCES, errno.EPERM):
+        return PermissionDenied(f"{context}: permission denied (install the udev rule)")
+    if exc.errno in (errno.ENODEV, errno.ENOENT):
+        return DeviceNotFound(f"{context}: {exc.strerror or exc}")
+    if exc.errno in (errno.EIO, errno.ESHUTDOWN, errno.ETIMEDOUT):
+        return NoReply(f"{context}: {exc.strerror or exc}")
+    return DeviceError(f"{context}: {exc.strerror or exc}")
+
+
+def with_backup(exc: DeviceError, backup: str | None) -> DeviceError:
+    """Attach the pre-write backup path to an error exactly once."""
+    if backup and not exc.backup:
+        exc.backup = backup
+        message = str(exc)
+        if backup not in message:
+            exc.args = (f"{message} (backup: {backup})",)
+    return exc
+
+
+def sanitize_name(name: object) -> str:
+    """Make device-derived text safe for one-line human-readable output."""
+    text = ANSI_RE.sub("", str(name or ""))
+    text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    text = CONTROL_RE.sub("", text)
+    return " ".join(text.split())[:120]
+
+
+def friendly_name(raw: str, product: int) -> str:
+    clean = sanitize_name(raw)
+    if clean and "eweadn" in clean.lower():
+        return clean
+    return PRODUCT_NAMES.get(product, f"EWEADN device {product:04x}")
+
+
+def _read_report_descriptor(hidraw_dir: str) -> bytes | None:
+    path = os.path.join(hidraw_dir, "device", "report_descriptor")
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(65536)
+    except OSError:
+        return None
+
+
+def descriptor_matches(
+    descriptor: bytes, usage_page: int = 0xFF00, report_id: int = REPORT_ID
+) -> bool:
+    """Return True for a vendor-page feature report with the expected ID."""
+    index = 0
+    current_page = 0
+    current_report = 0
+    stack: list[tuple[int, int]] = []
+    sizes = {0: 0, 1: 1, 2: 2, 3: 4}
+    while index < len(descriptor):
+        prefix = descriptor[index]
+        index += 1
+        if prefix == 0xFE:  # long item
+            if index + 2 > len(descriptor):
+                return False
+            size = descriptor[index]
+            index += 2
+            if index + size > len(descriptor):
+                return False
+            index += size
+            continue
+        size = sizes[prefix & 0x03]
+        if index + size > len(descriptor):
+            return False
+        value = (
+            int.from_bytes(descriptor[index : index + size], "little")
+            if size
+            else 0
+        )
+        index += size
+        item_type = (prefix >> 2) & 0x03
+        tag = (prefix >> 4) & 0x0F
+        if item_type == 0:  # main item
+            if tag == 0x0B and current_page == usage_page and current_report == report_id:
+                return True
+        elif item_type == 1:  # global item
+            if tag == 0x00:
+                current_page = value
+            elif tag == 0x08:
+                current_report = value
+            elif tag == 0x0A:
+                stack.append((current_page, current_report))
+            elif tag == 0x0B and stack:
+                current_page, current_report = stack.pop()
+    return False
+
+
+def candidates(root: str | None = None) -> list[tuple[str, str, int, int]]:
+    """Return (device path, name, vendor, product) for vendor HID nodes."""
+    root = root or SYSFS_HIDRAW
     found: list[tuple[str, str, int, int]] = []
-    for uevent in glob.glob("/sys/class/hidraw/hidraw*/device/uevent"):
+    pattern = os.path.join(root, "hidraw*", "device", "uevent")
+    for uevent in glob.glob(pattern):
         try:
             with open(uevent, encoding="utf-8", errors="replace") as handle:
                 text = handle.read()
@@ -172,11 +311,18 @@ def candidates() -> list[tuple[str, str, int, int]]:
 
         if vendor != VID or product not in KNOWN_PIDS:
             continue
-        if HID_NAME_MATCH not in name.lower() and product not in (0x1026, 0x1027):
+
+        hidraw_dir = os.path.dirname(os.path.dirname(uevent))
+        descriptor = _read_report_descriptor(hidraw_dir)
+        if descriptor is None or not descriptor_matches(descriptor):
+            # Never guess from VID/PID alone: input/keyboard nodes do not
+            # carry the vendor feature report used by this helper.
             continue
 
-        hidraw = os.path.basename(os.path.dirname(os.path.dirname(uevent)))
-        found.append(("/dev/" + hidraw, name, vendor, product))
+        hidraw = os.path.basename(hidraw_dir)
+        found.append(
+            ("/dev/" + hidraw, friendly_name(name, product), vendor, product)
+        )
 
     found.sort()
     return found
@@ -198,40 +344,149 @@ def build_request(cmd: int, sub: int, data: bytes = b"", encap: int = 0) -> byte
     return bytes(request)
 
 
-def lock_path() -> str:
+def state_home() -> str:
+    configured = os.environ.get("XDG_STATE_HOME")
+    if configured and os.path.isabs(configured):
+        return configured
+    return os.path.join(os.path.expanduser("~"), ".local", "state")
+
+
+def ensure_private_directory(
+    path: str, label: str, error: type[DeviceError] = DeviceError
+) -> None:
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        info = os.lstat(path)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise error(f"{label} {path} is not a real directory")
+        if info.st_uid != os.getuid():
+            raise error(f"{label} {path} is not owned by uid {os.getuid()}")
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            os.chmod(path, 0o700)
+    except DeviceError:
+        raise
+    except OSError as exc:
+        raise error(f"could not prepare {label} {path}: {exc}") from exc
+
+
+def _verified_runtime_dir() -> str | None:
     runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime or not os.path.isabs(runtime):
+        return None
+    try:
+        info = os.lstat(runtime)
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return None
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        return None
+    return runtime
+
+
+def lock_path() -> str:
+    runtime = _verified_runtime_dir()
     if runtime:
         return os.path.join(runtime, "eweadn-battery.lock")
-    return os.path.join("/tmp", f"eweadn-battery-{os.getuid()}.lock")
+    return os.path.join(state_home(), "eweadn-battery", "lock")
+
+
+def release_lock(fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
 
 
 def acquire_lock() -> int:
-    fd = os.open(lock_path(), os.O_CREAT | os.O_RDWR, 0o600)
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    return fd
+    """Take a private, bounded, non-blocking lock on the vendor HID device."""
+    path = lock_path()
+    runtime = _verified_runtime_dir()
+    if runtime is None:
+        ensure_private_directory(
+            os.path.dirname(path), "lock directory", LockError
+        )
+
+    flags = os.O_CREAT | os.O_RDWR
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise LockError(f"could not open lock {path}: {exc}") from exc
+
+    deadline = time.monotonic() + LOCK_TIMEOUT
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise LockError(
+                        "another eweadn-battery process is busy "
+                        f"(lock {path})"
+                    ) from exc
+                time.sleep(LOCK_RETRY)
+            except OSError as exc:
+                raise LockError(f"could not lock {path}: {exc}") from exc
+
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise LockError(f"lock {path} is not a regular file")
+        if info.st_uid != os.getuid():
+            raise LockError(f"lock {path} is not owned by uid {os.getuid()}")
+        os.fchmod(fd, 0o600)
+        path_info = os.lstat(path)
+        if (path_info.st_dev, path_info.st_ino) != (info.st_dev, info.st_ino):
+            raise LockError(f"lock {path} was replaced while acquiring it")
+        return fd
+    except LockError:
+        release_lock(fd)
+        raise
+    except OSError as exc:
+        release_lock(fd)
+        raise LockError(f"could not prepare lock {path}: {exc}") from exc
+    except BaseException:
+        release_lock(fd)
+        raise
 
 
 class HidSession:
     """One open hidraw node with serialized request/response exchanges."""
 
     def __init__(
-        self, path: str, name: str, vendor: int, product: int, lock_fd: int
+        self, path: str, name: str, vendor: int, product: int, lock_fd: int | None
     ):
         self.path = path
         self.name = name
         self.vendor = vendor
         self.product = product
-        self.lock_fd = lock_fd
-        self.fd = os.open(path, os.O_RDWR)
+        self.lock_fd: int | None = lock_fd
+        self.fd: int | None = None
+        try:
+            self.fd = os.open(path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0))
+        except OSError as exc:
+            raise map_os_error(exc, f"could not open {path}") from exc
 
     def close(self) -> None:
         if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None  # type: ignore[assignment]
+            fd = self.fd
+            self.fd = None
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         if self.lock_fd is not None:
-            fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
-            os.close(self.lock_fd)
-            self.lock_fd = None  # type: ignore[assignment]
+            fd = self.lock_fd
+            self.lock_fd = None
+            release_lock(fd)
 
     def __enter__(self) -> "HidSession":
         return self
@@ -242,14 +497,15 @@ class HidSession:
     def _exchange(
         self, cmd: int, sub: int, data: bytes, timeout: float, encap: int = 0
     ) -> tuple[bytes, bytes]:
+        if self.fd is None:
+            raise DeviceNotFound("HID device is closed")
+        fd = self.fd
         request = bytearray(build_request(cmd, sub, data, encap))
 
         try:
-            fcntl.ioctl(self.fd, HIDIOCSFEATURE, request)
+            fcntl.ioctl(fd, HIDIOCSFEATURE, request)
         except OSError as exc:
-            if exc.errno in (errno.EACCES, errno.EPERM):
-                raise PermissionDenied("permission denied (install the udev rule)") from exc
-            raise
+            raise map_os_error(exc, "could not send the feature report") from exc
 
         # The receiver needs a moment to stage the answer.
         time.sleep(0.06)
@@ -259,8 +515,19 @@ class HidSession:
             reply = bytearray(FRAME_SIZE)
             reply[0] = REPORT_ID
             try:
-                fcntl.ioctl(self.fd, HIDIOCGFEATURE, reply)
-            except OSError:
+                fcntl.ioctl(fd, HIDIOCGFEATURE, reply)
+            except OSError as exc:
+                if exc.errno in (
+                    errno.EACCES,
+                    errno.EPERM,
+                    errno.ENODEV,
+                    errno.ENOENT,
+                    errno.EIO,
+                    errno.ESHUTDOWN,
+                ):
+                    raise map_os_error(
+                        exc, "could not read the feature report"
+                    ) from exc
                 time.sleep(0.008)
                 continue
 
@@ -301,8 +568,9 @@ class HidSession:
                 return self._exchange(cmd, sub, data, timeout, encap)
             except (NoReply, ProtocolError) as exc:
                 last = exc
-        assert last is not None
-        raise last
+        if last is not None:
+            raise last
+        raise NoReply("no reply (mouse asleep or out of range)")
 
 
 def find_session() -> HidSession:
@@ -311,30 +579,32 @@ def find_session() -> HidSession:
         raise DeviceNotFound("EWEADN receiver not found")
 
     lock_fd = acquire_lock()
-    permission_denied = False
-    last_error: OSError | None = None
     try:
+        # The receiver may have been unplugged or re-enumerated while we
+        # waited for the lock, so discover the nodes again.
+        nodes = candidates()
+        if not nodes:
+            raise DeviceNotFound("EWEADN receiver not found")
+
+        permission_error: PermissionDenied | None = None
+        last_error: DeviceError | None = None
         for path, name, vendor, product in nodes:
             try:
                 return HidSession(path, name, vendor, product, lock_fd)
-            except PermissionError:
-                permission_denied = True
-            except OSError as exc:
+            except PermissionDenied as exc:
+                permission_error = exc
                 last_error = exc
-                if exc.errno in (errno.EACCES, errno.EPERM):
-                    permission_denied = True
-    except BaseException:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        os.close(lock_fd)
-        raise
+            except DeviceError as exc:
+                last_error = exc
 
-    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-    os.close(lock_fd)
-    if permission_denied:
-        raise PermissionDenied("permission denied (install the udev rule)")
-    if last_error is not None:
-        raise DeviceNotFound(f"could not open receiver: {last_error}")
-    raise DeviceNotFound("EWEADN receiver not found")
+        if permission_error is not None:
+            raise permission_error
+        if last_error is not None:
+            raise last_error
+        raise DeviceNotFound("EWEADN receiver not found")
+    except BaseException:
+        release_lock(lock_fd)
+        raise
 
 
 def source_for_product(product: int) -> str:
@@ -349,25 +619,49 @@ def read_chunks(
     *,
     packet_limit: int = 10,
 ) -> bytes:
-    """Read a multi-packet feature response (DPI table, key table)."""
+    """Read a multi-packet feature response and require the full payload."""
+    if total <= 0:
+        return b""
     chunks = max(1, (total + packet_limit - 1) // packet_limit)
     data = bytearray()
     for index in range(chunks):
         try:
             chunk, _ = session.query(cmd, sub + index, encap=index)
-        except DeviceError:
-            if data:
-                break
-            raise
+        except DeviceError as exc:
+            if not data:
+                # Nothing was returned yet, so preserve the transport error
+                # (permission, sleep, etc.) instead of reporting corruption.
+                raise
+            raise ProtocolError(
+                f"multipacket read failed at chunk {index + 1}/{chunks}: "
+                f"expected {total} bytes, received {len(data)} bytes "
+                f"({exc})"
+            ) from exc
         if not chunk:
-            break
+            raise ProtocolError(
+                f"multipacket read failed at chunk {index + 1}/{chunks}: "
+                f"empty reply; expected {total} bytes, received {len(data)} "
+                "bytes"
+            )
         # Follow-up responses carry a one-byte sequence/offset prefix before
         # the next slice of the logical payload.
         if index > 0:
             chunk = chunk[1:]
+            if not chunk:
+                raise ProtocolError(
+                    f"multipacket read failed at chunk {index + 1}/{chunks}: "
+                    f"sequence-only reply; expected {total} bytes, received "
+                    f"{len(data)} bytes"
+                )
         data.extend(chunk)
         if len(data) >= total:
             break
+
+    if len(data) < total:
+        raise ProtocolError(
+            f"short multipacket reply: expected {total} bytes, received "
+            f"{len(data)} bytes"
+        )
     return bytes(data[:total])
 
 
@@ -512,14 +806,20 @@ def parse_keys(data: bytes) -> list[dict]:
     return keys
 
 
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-BT_NAME_MATCHES = ("eweadn", "s9")
+def resolve_bluetoothctl() -> str:
+    path = shutil.which("bluetoothctl")
+    if not path:
+        raise DeviceNotFound("bluetoothctl is not installed")
+    if not os.path.isabs(path):
+        raise DeviceNotFound("refusing to run bluetoothctl from a relative path")
+    return path
 
 
 def bluetoothctl(*args: str) -> str:
+    command = resolve_bluetoothctl()
     try:
         result = subprocess.run(
-            ["bluetoothctl", *args],
+            [command, *args],
             capture_output=True,
             text=True,
             timeout=3,
@@ -529,51 +829,76 @@ def bluetoothctl(*args: str) -> str:
         raise DeviceNotFound("bluetoothctl is not installed") from exc
     except subprocess.TimeoutExpired as exc:
         raise NoReply("Bluetooth query timed out") from exc
-    return ANSI_RE.sub("", result.stdout + "\n" + result.stderr)
+    except OSError as exc:
+        raise map_os_error(exc, "could not run bluetoothctl") from exc
+
+    text = ANSI_RE.sub("", result.stdout + "\n" + result.stderr)
+    if result.returncode != 0:
+        detail = sanitize_name(text) or f"exit status {result.returncode}"
+        raise NoReply(
+            f"bluetoothctl {' '.join(args)} failed: {detail}"
+        )
+    return text
 
 
 def parse_bluetooth_devices(text: str) -> list[tuple[str, str]]:
     devices: list[tuple[str, str]] = []
     for line in text.splitlines():
-        match = re.match(r"Device\s+([0-9A-Fa-f:]{17})\s+(.+)", line.strip())
-        if match:
-            devices.append((match.group(1), match.group(2).strip()))
+        match = re.match(
+            r"Device\s+([0-9A-Fa-f:]{17})\s+(.+)", ANSI_RE.sub("", line).strip()
+        )
+        if not match or not MAC_RE.fullmatch(match.group(1)):
+            continue
+        name = sanitize_name(match.group(2))
+        if name:
+            devices.append((match.group(1), name))
     return devices
 
 
+def bluetooth_name_matches(name: str) -> bool:
+    clean = sanitize_name(name).lower()
+    for term in BT_NAME_TERMS:
+        pattern = rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])"
+        if re.search(pattern, clean):
+            return True
+    return False
+
+
 def parse_bluetooth_info(text: str) -> dict:
+    text = ANSI_RE.sub("", text)
     percent = None
-    matches = re.findall(
-        r"Battery Percentage:\s+(?:0x[0-9A-Fa-f]+\s+)?\((\d+)\)", text
-    )
-    if not matches:
-        matches = re.findall(r"Battery Percentage:\s+(\d+)%?", text)
-    if matches:
-        value = int(matches[-1])
+    for match in BATTERY_PERCENT_RE.finditer(text):
+        value = int(match.group(1) or match.group(2))
         if 0 <= value <= 100:
             percent = value
+            break
 
     connected = bool(re.search(r"^\s*Connected:\s+yes\s*$", text, re.MULTILINE))
     name_match = re.search(r"^\s*Name:\s+(.+)$", text, re.MULTILINE)
+    name = sanitize_name(name_match.group(1)) if name_match else None
     return {
         "connected": connected,
         "percent": percent,
-        "name": name_match.group(1).strip() if name_match else None,
+        "name": name or None,
     }
 
 
 def read_bluetooth_battery() -> dict:
     devices = parse_bluetooth_devices(bluetoothctl("devices"))
     candidates = [
-        (mac, name)
-        for mac, name in devices
-        if any(term in name.lower() for term in BT_NAME_MATCHES)
+        (mac, name) for mac, name in devices if bluetooth_name_matches(name)
     ]
     if not candidates:
         raise DeviceNotFound("no paired EWEADN Bluetooth device")
 
+    last_error: DeviceError | None = None
     for mac, advertised_name in candidates:
-        info = parse_bluetooth_info(bluetoothctl("info", mac))
+        try:
+            info_text = bluetoothctl("info", mac)
+        except DeviceError as exc:
+            last_error = exc
+            continue
+        info = parse_bluetooth_info(info_text)
         if not info["connected"] or info["percent"] is None:
             continue
         name = info["name"] or advertised_name
@@ -596,6 +921,8 @@ def read_bluetooth_battery() -> dict:
             },
         }
 
+    if last_error is not None:
+        raise NoReply(f"could not read EWEADN Bluetooth battery: {last_error}")
     raise DeviceNotFound(
         "EWEADN Bluetooth device is not connected or exposes no battery level"
     )
@@ -625,6 +952,16 @@ def bluetooth_config() -> tuple[dict, dict]:
     return config, {"bluetooth": battery["raw"]}
 
 
+def _fallback_allowed(exc: DeviceError) -> bool:
+    return isinstance(exc, (DeviceNotFound, NoReply))
+
+
+def combine_errors(primary: DeviceError, secondary: DeviceError) -> DeviceError:
+    combined = type(primary)(f"{primary}; Bluetooth: {secondary}")
+    combined.backup = getattr(primary, "backup", None)
+    return combined
+
+
 def read_battery(session: HidSession | None = None) -> tuple[dict, bytes]:
     own = session is None
     usb_error: DeviceError | None = None
@@ -633,6 +970,8 @@ def read_battery(session: HidSession | None = None) -> tuple[dict, bytes]:
         try:
             session = find_session()
         except DeviceError as exc:
+            if not _fallback_allowed(exc):
+                raise
             usb_error = exc
 
     if session is not None:
@@ -655,6 +994,8 @@ def read_battery(session: HidSession | None = None) -> tuple[dict, bytes]:
             }
             return result, raw
         except DeviceError as exc:
+            if not _fallback_allowed(exc):
+                raise
             usb_error = exc
         finally:
             if own:
@@ -662,27 +1003,44 @@ def read_battery(session: HidSession | None = None) -> tuple[dict, bytes]:
 
     try:
         return read_bluetooth_battery(), b""
-    except DeviceError:
+    except DeviceError as bt_error:
         if usb_error is not None:
-            raise usb_error
+            raise combine_errors(usb_error, bt_error)
         raise
 
 
 def read_config(session: HidSession | None = None) -> tuple[dict, dict]:
     own = session is None
-    session = session or find_session()
+    if session is None:
+        session = find_session()
     try:
         basics_data, basics_raw = session.query(0x4F, 0x81)
         sensor_data, sensor_raw = session.query(0x4F, 0x40)
-        dpi_data = read_chunks(session, 0x4F, 0x41, 64)
-        keys_data = read_chunks(session, 0x4F, 0x00, 48)
+        dpi_data = read_chunks(session, 0x4F, 0x41, DPI_TABLE_SIZE)
+        keys_data = read_chunks(session, 0x4F, 0x00, KEY_TABLE_SIZE)
         dpi_raw = dpi_data[:16]
         keys_raw = keys_data[:16]
 
         basics = parse_basics(basics_data)
         sensor = parse_sensor(sensor_data)
+        stage_count = sensor["stage_count"]
+        if not 1 <= stage_count <= 8:
+            raise ProtocolError(
+                f"sensor reported invalid DPI stage count {stage_count}"
+            )
         max_dpi = basics["max_dpi"] or 30000
-        stages = parse_dpi(dpi_data, max_dpi)[: sensor["stage_count"]]
+        parsed_stages = parse_dpi(dpi_data, max_dpi)
+        if len(parsed_stages) < stage_count:
+            raise ProtocolError(
+                f"DPI table has {len(parsed_stages)} stages, expected "
+                f"{stage_count}"
+            )
+        stages = parsed_stages[:stage_count]
+        buttons = parse_keys(keys_data)
+        if len(buttons) != 5:
+            raise ProtocolError(
+                f"button table has {len(buttons)} buttons, expected 5"
+            )
         wired = session.product in CABLE_PIDS
         rate_code = (
             sensor["wired_rate_code"] if wired else sensor["wireless_rate_code"]
@@ -709,10 +1067,10 @@ def read_config(session: HidSession | None = None) -> tuple[dict, dict]:
                 "sensor_code": basics["sensor_code"],
                 "max_dpi": max_dpi,
                 "current_stage": sensor["current_stage"],
-                "stage_count": sensor["stage_count"],
+                "stage_count": stage_count,
                 "stages": stages,
             },
-            "buttons": parse_keys(keys_data),
+            "buttons": buttons,
             "profile": {
                 "current": basics["profile"]["current"],
                 "max": basics["profile"]["max"],
@@ -732,21 +1090,222 @@ def read_config(session: HidSession | None = None) -> tuple[dict, dict]:
             session.close()
 
 
-def backup_path() -> str:
-    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-    directory = os.path.join(state, "eweadn-battery", "backups")
-    os.makedirs(directory, mode=0o700, exist_ok=True)
+def backup_directory() -> str:
+    return os.path.join(state_home(), "eweadn-battery", "backups")
+
+
+def _next_backup_target(directory: str) -> str:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    return os.path.join(directory, f"eweadn-config-{stamp}.json")
+    target = os.path.join(directory, f"eweadn-config-{stamp}.json")
+    counter = 1
+    while os.path.lexists(target):
+        target = os.path.join(
+            directory, f"eweadn-config-{stamp}-{counter}.json"
+        )
+        counter += 1
+    return target
+
+
+def backup_path() -> str:
+    directory = backup_directory()
+    ensure_private_directory(directory, "backup directory", BackupError)
+    return _next_backup_target(directory)
+
+
+def _collision_target(path: str) -> str:
+    stem, suffix = os.path.splitext(path)
+    counter = 1
+    while True:
+        candidate = f"{stem}-{counter}{suffix}"
+        if not os.path.lexists(candidate):
+            return candidate
+        counter += 1
+
+
+def _check_backup_target(path: str) -> None:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise BackupError(f"could not inspect backup {path}: {exc}") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise BackupError(f"refusing to write through symlink backup {path}")
+    if not stat.S_ISREG(info.st_mode):
+        raise BackupError(f"backup target {path} is not a regular file")
 
 
 def save_backup(config: dict, path: str | None = None) -> str:
-    target = path or backup_path()
-    os.makedirs(os.path.dirname(os.path.abspath(target)), mode=0o700, exist_ok=True)
-    with open(target, "w", encoding="utf-8") as handle:
-        json.dump(config, handle, indent=2, sort_keys=True)
-        handle.write("\n")
+    """Write a 0600 backup atomically; automatic names never overwrite."""
+    automatic = path is None
+    if automatic:
+        target = backup_path()
+    else:
+        if not path:
+            raise BackupError("backup path must not be empty")
+        target = os.path.abspath(os.path.expanduser(path))
+
+    directory = os.path.dirname(target)
+    temp_path: str | None = None
+    fd = -1
+    try:
+        if automatic:
+            ensure_private_directory(directory, "backup directory", BackupError)
+        else:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            info = os.lstat(directory)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise BackupError(
+                    f"backup directory {directory} is not a real directory"
+                )
+            _check_backup_target(target)
+
+        payload = json.dumps(config, indent=2, sort_keys=True) + "\n"
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".eweadn-battery-", suffix=".tmp", dir=directory
+        )
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        if automatic:
+            # A hard link publishes the complete file atomically and fails
+            # with EEXIST instead of replacing an existing backup.
+            for _ in range(100):
+                try:
+                    os.link(temp_path, target, follow_symlinks=False)
+                    break
+                except FileExistsError:
+                    target = _collision_target(target)
+            else:
+                raise BackupError("could not choose a unique backup name")
+            os.unlink(temp_path)
+            temp_path = None
+        else:
+            os.replace(temp_path, target)
+            temp_path = None
+    except BackupError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise BackupError(f"could not write backup {target}: {exc}") from exc
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
     return target
+
+
+def _format_raw(raw: tuple[object, ...]) -> str:
+    if not raw or not all(isinstance(value, int) for value in raw):
+        return "missing"
+    return " ".join(f"{value:02x}" for value in raw)
+
+
+def verify_config(
+    config: dict,
+    expectations: list[dict],
+    *,
+    backup: str | None = None,
+) -> None:
+    """Compare the exact fields that a write was supposed to change."""
+    for expected in expectations:
+        kind = expected["kind"]
+        if kind == "polling":
+            sensor = config.get("sensor") or {}
+            transport = expected["transport"]
+            actual = sensor.get(f"{transport}_rate_code")
+            code = expected["code"]
+            if actual != code:
+                actual_hz = POLLING_RATES.get(actual)
+                read = (
+                    f"{actual_hz} Hz (code {actual})"
+                    if actual_hz is not None
+                    else f"code {actual}"
+                )
+                raise ProtocolError(
+                    f"write verification failed for {transport} polling: "
+                    f"expected {POLLING_RATES[code]} Hz (code {code}), "
+                    f"read {read}",
+                    backup=backup,
+                )
+        elif kind == "dpi":
+            dpi = config.get("dpi") or {}
+            stages = {
+                stage.get("index"): stage
+                for stage in (dpi.get("stages") or [])
+            }
+            stage = stages.get(expected["stage"])
+            expected_text = (
+                f"{expected['dpi']} DPI {expected['color']} with "
+                f"{expected['stage_count']} stages"
+            )
+            if (
+                stage is None
+                or stage.get("dpi") != expected["dpi"]
+                or stage.get("color") != expected["color"]
+                or dpi.get("stage_count") != expected["stage_count"]
+            ):
+                if stage is None:
+                    actual_text = "stage missing"
+                else:
+                    actual_text = (
+                        f"{stage.get('dpi')} DPI {stage.get('color')} with "
+                        f"{dpi.get('stage_count')} stages"
+                    )
+                raise ProtocolError(
+                    f"write verification failed for DPI stage "
+                    f"{expected['stage']}: expected {expected_text}, "
+                    f"read {actual_text}",
+                    backup=backup,
+                )
+        elif kind == "dpi_current":
+            actual = (config.get("dpi") or {}).get("current_stage")
+            if actual != expected["stage"]:
+                raise ProtocolError(
+                    f"write verification failed for the active DPI stage: "
+                    f"expected {expected['stage']}, read {actual}",
+                    backup=backup,
+                )
+        elif kind == "button":
+            index = expected["index"]
+            buttons = config.get("buttons") or []
+            if index < len(buttons):
+                button = buttons[index]
+                actual = tuple(
+                    button.get(key)
+                    for key in ("key_type", "code1", "code2", "code3")
+                )
+            else:
+                actual = ()
+            wanted = tuple(expected["raw"])
+            if actual != wanted:
+                raise ProtocolError(
+                    f"write verification failed for button "
+                    f"{BUTTON_NAMES[index]}: expected raw "
+                    f"{_format_raw(wanted)}, read {_format_raw(actual)}",
+                    backup=backup,
+                )
+        else:
+            raise ValueError(f"unknown verification kind {kind}")
+
+
+def apply_write(session: HidSession, cmd: int, sub: int, data: bytes) -> None:
+    try:
+        session.query(cmd, sub, data, attempts=2, timeout=0.25)
+    except NoReply:
+        # The receiver sometimes applies a write without returning an ack.
+        # Verification below is the source of truth.
+        pass
 
 
 def write_and_verify(
@@ -754,39 +1313,25 @@ def write_and_verify(
     cmd: int,
     sub: int,
     data: bytes,
-    expected: dict,
-) -> tuple[dict, str]:
-    """Apply a write, tolerate a missing ack, and verify by re-reading."""
+    expectations: list[dict],
+    *,
+    backup: str | None = None,
+) -> dict:
     try:
-        session.query(cmd, sub, data, attempts=2, timeout=0.25)
-    except NoReply:
-        pass
-
-    after, _ = read_config(session)
-    for key, value in expected.items():
-        if key == "polling_hz":
-            actual = after["polling"]["hz"]
-        elif key == "dpi":
-            stage = after["dpi"]["current_stage"]
-            stages = {s["index"]: s for s in after["dpi"]["stages"]}
-            actual = stages.get(stage, {}).get("dpi")
-            value = value.get("dpi") if isinstance(value, dict) else value
-        elif key == "button":
-            index = value["index"]
-            actual = after["buttons"][index]["action"] if index < len(after["buttons"]) else None
-            value = value["action"]
-        else:
-            raise KeyError(key)
-        if actual != value:
-            raise ProtocolError(
-                f"write verification failed for {key}: expected {value!r}, read {actual!r}"
-            )
-    return after, ""
+        apply_write(session, cmd, sub, data)
+        after, _ = read_config(session)
+    except DeviceError as exc:
+        raise with_backup(exc, backup)
+    verify_config(after, expectations, backup=backup)
+    return after
 
 
 def plan_polling(config: dict, hz: int, wired: bool | None) -> tuple[bytes, dict]:
     if hz not in HZ_TO_CODE:
-        raise ValueError(f"unsupported polling rate {hz}; choose one of {sorted(HZ_TO_CODE)}")
+        raise ValueError(
+            f"unsupported polling rate {hz}; choose one of "
+            f"{sorted(HZ_TO_CODE)}"
+        )
     use_wired = config["device"]["wired"] if wired is None else wired
     code = HZ_TO_CODE[hz]
     value = (code << 4) if use_wired else code
@@ -795,6 +1340,7 @@ def plan_polling(config: dict, hz: int, wired: bool | None) -> tuple[bytes, dict
     return bytes([value]), {
         "transport": "wired" if use_wired else "wireless",
         "hz": hz,
+        "code": code,
         "value": value,
     }
 
@@ -806,7 +1352,8 @@ def plan_dpi(
     stage_count: int | None,
     color: str | None,
 ) -> tuple[bytes, dict]:
-    stage_count = stage_count or config["dpi"]["stage_count"]
+    if stage_count is None:
+        stage_count = config["dpi"]["stage_count"]
     max_dpi = config["dpi"]["max_dpi"]
     if not 1 <= stage <= 8:
         raise ValueError("DPI stage must be between 1 and 8")
@@ -820,19 +1367,18 @@ def plan_dpi(
         raise ValueError("DPI must be a multiple of 50")
 
     stages = {s["index"]: s for s in config["dpi"]["stages"]}
-    if stage not in stages and color is None:
-        raise ValueError(f"DPI stage {stage} was not returned by the mouse")
-    stage_color = color or stages[stage]["color"]
-    if not stage_color.startswith("#") or len(stage_color) != 7:
-        raise ValueError("color must be #RRGGBB")
-    try:
-        rgb = bytes.fromhex(stage_color[1:])
-    except ValueError as exc:
-        raise ValueError("color must be #RRGGBB") from exc
+    if color is not None:
+        if not COLOR_RE.fullmatch(color):
+            raise ValueError("color must be #RRGGBB")
+        stage_color = color.lower()
+    else:
+        if stage not in stages:
+            raise ValueError(f"DPI stage {stage} was not returned by the mouse")
+        stage_color = stages[stage]["color"].lower()
 
     raw = encode_dpi(dpi, max_dpi)
     combined = ((stage & 0x0F) << 4) | (stage_count & 0x0F)
-    payload = bytes([combined, raw & 0xFF, (raw >> 8) & 0xFF, *rgb])
+    payload = bytes([combined, raw & 0xFF, (raw >> 8) & 0xFF, *bytes.fromhex(stage_color[1:])])
     return payload, {
         "stage": stage,
         "stage_count": stage_count,
@@ -846,7 +1392,9 @@ def plan_button(index: int, action: str) -> tuple[int, bytes, dict]:
     if not 0 <= index <= 4:
         raise ValueError("button index must be 0-4")
     if action not in BUTTON_ACTIONS:
-        raise ValueError(f"unknown action {action}; choose one of {', '.join(ACTION_NAMES)}")
+        raise ValueError(
+            f"unknown action {action}; choose one of {', '.join(ACTION_NAMES)}"
+        )
     key_type, code, times, gap = BUTTON_ACTIONS[action]
     pos = KEY_POS[BUTTON_NAMES[index]]
     payload = bytes([key_type, code, times, gap])
@@ -861,6 +1409,286 @@ def plan_button(index: int, action: str) -> tuple[int, bytes, dict]:
     }
 
 
+def _backup_int(
+    mapping: dict, key: str, label: str, minimum: int, maximum: int
+) -> int:
+    value = mapping.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RestoreError(f"{label} must be an integer")
+    if not minimum <= value <= maximum:
+        raise RestoreError(
+            f"{label} must be between {minimum} and {maximum}"
+        )
+    return value
+
+
+def normalize_backup(document: dict) -> dict:
+    if not isinstance(document, dict):
+        raise RestoreError("backup must contain a JSON object")
+
+    device = document.get("device") or {}
+    if not isinstance(device, dict):
+        raise RestoreError("backup device information is invalid")
+    wired = device.get("wired", False)
+    if not isinstance(wired, bool):
+        raise RestoreError("backup device.wired must be true or false")
+
+    polling = document.get("polling")
+    if not isinstance(polling, dict):
+        raise RestoreError("backup is missing polling settings")
+    hz = polling.get("hz")
+    code = polling.get("code")
+    if hz is None and isinstance(code, int) and not isinstance(code, bool):
+        hz = POLLING_RATES.get(code)
+    if isinstance(hz, bool) or not isinstance(hz, int) or hz not in HZ_TO_CODE:
+        raise RestoreError(f"backup polling rate is not supported: {hz!r}")
+    expected_code = HZ_TO_CODE[hz]
+    if code is not None and (
+        isinstance(code, bool) or not isinstance(code, int)
+        or code != expected_code
+    ):
+        raise RestoreError("backup polling code does not match its rate")
+    single_adjust = polling.get("is_single_adjust", False)
+    if not isinstance(single_adjust, bool):
+        raise RestoreError(
+            "backup polling.is_single_adjust must be true or false"
+        )
+
+    dpi = document.get("dpi")
+    if not isinstance(dpi, dict):
+        raise RestoreError("backup is missing DPI settings")
+    stage_count = _backup_int(dpi, "stage_count", "backup DPI stage count", 1, 8)
+    max_dpi = dpi.get("max_dpi", 30000)
+    if isinstance(max_dpi, bool) or not isinstance(max_dpi, int) or max_dpi < 50:
+        raise RestoreError("backup DPI maximum is invalid")
+    current_stage = _backup_int(
+        dpi, "current_stage", "backup current DPI stage", 1, stage_count
+    )
+    stages_raw = dpi.get("stages")
+    if not isinstance(stages_raw, list):
+        raise RestoreError("backup is missing the DPI stage table")
+
+    stages: dict[int, dict] = {}
+    for entry in stages_raw:
+        if not isinstance(entry, dict):
+            raise RestoreError("backup DPI stage entry is invalid")
+        index = _backup_int(entry, "index", "backup DPI stage index", 1, 8)
+        if index in stages:
+            raise RestoreError(f"backup repeats DPI stage {index}")
+        value = _backup_int(
+            entry, "dpi", f"backup DPI stage {index} value", 50, max_dpi
+        )
+        if value % 50:
+            raise RestoreError(
+                f"backup DPI stage {index} is not a multiple of 50"
+            )
+        color = entry.get("color")
+        if not isinstance(color, str) or not COLOR_RE.fullmatch(color):
+            raise RestoreError(f"backup DPI stage {index} color is invalid")
+        stages[index] = {
+            "index": index,
+            "dpi": value,
+            "color": color.lower(),
+            "raw": encode_dpi(value, max_dpi),
+        }
+
+    missing = [index for index in range(1, stage_count + 1) if index not in stages]
+    if missing:
+        raise RestoreError(
+            "backup is missing DPI stage(s) "
+            + ", ".join(str(index) for index in missing)
+        )
+
+    buttons_raw = document.get("buttons")
+    if not isinstance(buttons_raw, list) or len(buttons_raw) != 5:
+        raise RestoreError("backup must contain exactly five buttons")
+    buttons: dict[int, tuple[int, int, int, int]] = {}
+    for position, entry in enumerate(buttons_raw):
+        if not isinstance(entry, dict):
+            raise RestoreError("backup button entry is invalid")
+        if "index" in entry:
+            index = _backup_int(
+                entry, "index", "backup button index", 0, 4
+            )
+        else:
+            index = position
+        if index in buttons:
+            raise RestoreError(f"backup repeats button {index}")
+        raw = tuple(
+            _backup_int(entry, key, f"backup button {index} {key}", 0, 255)
+            for key in ("key_type", "code1", "code2", "code3")
+        )
+        buttons[index] = raw  # type: ignore[assignment]
+    if set(buttons) != {0, 1, 2, 3, 4}:
+        raise RestoreError("backup must contain buttons 0 through 4")
+
+    return {
+        "polling": {
+            "hz": hz,
+            "code": expected_code,
+            "transport": "wired" if wired else "wireless",
+            "single_adjust": single_adjust,
+        },
+        "dpi": {
+            "stage_count": stage_count,
+            "current_stage": current_stage,
+            "max_dpi": max_dpi,
+            "stages": [stages[index] for index in range(1, stage_count + 1)],
+        },
+        "buttons": [
+            {"index": index, "raw": buttons[index]}
+            for index in range(5)
+        ],
+    }
+
+
+def plan_restore(document: dict) -> tuple[list[dict], dict]:
+    normalized = normalize_backup(document)
+    polling = normalized["polling"]
+    dpi = normalized["dpi"]
+    buttons = normalized["buttons"]
+
+    code = polling["code"]
+    value = (code << 4) if polling["transport"] == "wired" else code
+    if polling["single_adjust"]:
+        value |= 0x80
+    operations: list[dict] = [
+        {
+            "label": "polling",
+            "cmd": 0x35,
+            "sub": 0x01,
+            "payload": bytes([value]),
+            "expected": {
+                "kind": "polling",
+                "transport": polling["transport"],
+                "code": code,
+                "hz": polling["hz"],
+            },
+        }
+    ]
+
+    order = [
+        index
+        for index in range(1, dpi["stage_count"] + 1)
+        if index != dpi["current_stage"]
+    ]
+    order.append(dpi["current_stage"])
+    for index in order:
+        stage = dpi["stages"][index - 1]
+        combined = ((index & 0x0F) << 4) | (dpi["stage_count"] & 0x0F)
+        payload = bytes(
+            [
+                combined,
+                stage["raw"] & 0xFF,
+                (stage["raw"] >> 8) & 0xFF,
+                *bytes.fromhex(stage["color"][1:]),
+            ]
+        )
+        operations.append(
+            {
+                "label": f"DPI stage {index}",
+                "cmd": 0x3A,
+                "sub": 0x00,
+                "payload": payload,
+                "expected": {
+                    "kind": "dpi",
+                    "stage": index,
+                    "stage_count": dpi["stage_count"],
+                    "dpi": stage["dpi"],
+                    "color": stage["color"],
+                },
+            }
+        )
+
+    for button in buttons:
+        operations.append(
+            {
+                "label": f"button {BUTTON_NAMES[button['index']]}",
+                "cmd": 0x30,
+                "sub": KEY_POS[BUTTON_NAMES[button["index"]]],
+                "payload": bytes(button["raw"]),
+                "expected": {
+                    "kind": "button",
+                    "index": button["index"],
+                    "raw": tuple(button["raw"]),
+                },
+            }
+        )
+
+    summary = {
+        "polling": {
+            "hz": polling["hz"],
+            "code": code,
+            "transport": polling["transport"],
+            "value": value,
+            "is_single_adjust": polling["single_adjust"],
+        },
+        "dpi": {
+            "stage_count": dpi["stage_count"],
+            "current_stage": dpi["current_stage"],
+            "max_dpi": dpi["max_dpi"],
+            "stages": [
+                {
+                    "index": stage["index"],
+                    "dpi": stage["dpi"],
+                    "color": stage["color"],
+                }
+                for stage in dpi["stages"]
+            ],
+        },
+        "buttons": [
+            {
+                "index": button["index"],
+                "button": BUTTON_NAMES[button["index"]],
+                "raw": _format_raw(tuple(button["raw"])),
+            }
+            for button in buttons
+        ],
+    }
+    return operations, summary
+
+
+def load_backup(path: str) -> dict:
+    if not path:
+        raise RestoreError("--backup requires a file path")
+    target = os.path.abspath(os.path.expanduser(path))
+    fd = -1
+    try:
+        info = os.lstat(target)
+        if stat.S_ISLNK(info.st_mode):
+            raise RestoreError(f"refusing to read symlink backup {target}")
+        if not stat.S_ISREG(info.st_mode):
+            raise RestoreError(f"backup {target} is not a regular file")
+        if info.st_size > BACKUP_SIZE_LIMIT:
+            raise RestoreError(f"backup {target} is too large")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(target, flags)
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            text = handle.read(BACKUP_SIZE_LIMIT + 1)
+    except RestoreError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise RestoreError(f"could not read backup {target}: {exc}") from exc
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    if len(text) > BACKUP_SIZE_LIMIT:
+        raise RestoreError(f"backup {target} is too large")
+    try:
+        document = json.loads(text)
+    except (ValueError, UnicodeError) as exc:
+        raise RestoreError(f"backup {target} is not valid JSON: {exc}") from exc
+    if not isinstance(document, dict):
+        raise RestoreError(f"backup {target} must contain a JSON object")
+    return document
+
+
 def emit(value: dict, as_json: bool) -> None:
     if as_json:
         print(json.dumps(value))
@@ -868,31 +1696,41 @@ def emit(value: dict, as_json: bool) -> None:
         if value.get("ok"):
             if "battery" in value and "dpi" not in value:
                 battery = value["battery"]
+                name = sanitize_name(value.get("name")) or "EWEADN device"
                 if battery["charging"]:
-                    print(f"{value['name']}: charging")
+                    print(f"{name}: charging")
                 else:
-                    print(f"{value['name']}: {battery['percent']}%")
+                    print(f"{name}: {battery['percent']}%")
             elif "dpi" in value:
                 print_config(value)
             elif value.get("dry_run"):
                 print("Dry run:", json.dumps(value.get("plan", {}), sort_keys=True))
+                if value.get("source"):
+                    print("Restore source:", sanitize_name(value["source"]))
                 print("Re-run with --apply to write this to the mouse.")
             elif value.get("applied"):
                 print("Applied:", json.dumps(value.get("plan", {}), sort_keys=True))
                 if value.get("backup"):
                     print("Backup:", value["backup"])
+                if value.get("source"):
+                    print("Restore source:", sanitize_name(value["source"]))
             elif value.get("path") and value.get("config"):
                 print("Backup:", value["path"])
             else:
                 print(json.dumps(value, indent=2, sort_keys=True))
         else:
-            print(f"eweadn-battery: {value.get('error', 'unknown error')}", file=sys.stderr)
+            print(
+                f"eweadn-battery: {value.get('error', 'unknown error')}",
+                file=sys.stderr,
+            )
 
 
 def print_config(config: dict) -> None:
     device = config["device"]
     battery = config["battery"]
-    print(f"{device['name']} on {device['source']}")
+    name = sanitize_name(device.get("name")) or "EWEADN device"
+    source = sanitize_name(device.get("source")) or "unknown connection"
+    print(f"{name} on {source}")
     if battery["charging"]:
         print("Battery: charging")
     else:
@@ -929,14 +1767,21 @@ def print_config(config: dict) -> None:
 
 
 def command_config(args: argparse.Namespace, as_json: bool) -> int:
+    debug = bool(getattr(args, "debug", False))
+    if debug:
+        as_json = True
     try:
         config, raw = read_config()
     except DeviceError as usb_error:
+        # Only absence is safe to translate into a battery-only Bluetooth
+        # view. A receiver that is present but broken must report its error.
+        if not isinstance(usb_error, DeviceNotFound):
+            raise
         try:
             config, raw = bluetooth_config()
-        except DeviceError:
-            raise usb_error
-    if args.debug:
+        except DeviceError as bt_error:
+            raise combine_errors(usb_error, bt_error)
+    if debug:
         config["raw"] = raw
     emit(config, as_json)
     return 0
@@ -951,20 +1796,38 @@ def command_backup(args: argparse.Namespace, as_json: bool) -> int:
 
 
 def command_set_polling(args: argparse.Namespace, as_json: bool) -> int:
+    if args.hz not in HZ_TO_CODE:
+        raise ValueError(
+            f"unsupported polling rate {args.hz}; choose one of "
+            f"{sorted(HZ_TO_CODE)}"
+        )
     session = find_session()
     try:
         config, _ = read_config(session)
-        payload, plan = plan_polling(config, args.hz, args.wired if args.wired else None)
+        payload, plan = plan_polling(
+            config, args.hz, args.wired if args.wired else None
+        )
         if not args.apply:
-            emit({"ok": True, "dry_run": True, "before": config, "plan": plan}, as_json)
+            emit(
+                {"ok": True, "dry_run": True, "before": config, "plan": plan},
+                as_json,
+            )
             return 0
         path = save_backup(config, args.backup)
-        after, _ = write_and_verify(
+        after = write_and_verify(
             session,
             0x35,
             0x01,
             payload,
-            {"polling_hz": args.hz},
+            [
+                {
+                    "kind": "polling",
+                    "transport": plan["transport"],
+                    "code": plan["code"],
+                    "hz": plan["hz"],
+                }
+            ],
+            backup=path,
         )
         emit(
             {
@@ -982,6 +1845,12 @@ def command_set_polling(args: argparse.Namespace, as_json: bool) -> int:
 
 
 def command_set_dpi(args: argparse.Namespace, as_json: bool) -> int:
+    if not 1 <= args.stage <= 8:
+        raise ValueError("DPI stage must be between 1 and 8")
+    if args.stage_count is not None and not 1 <= args.stage_count <= 8:
+        raise ValueError("stage count must be between 1 and 8")
+    if args.color is not None and not COLOR_RE.fullmatch(args.color):
+        raise ValueError("color must be #RRGGBB")
     session = find_session()
     try:
         config, _ = read_config(session)
@@ -989,15 +1858,27 @@ def command_set_dpi(args: argparse.Namespace, as_json: bool) -> int:
             config, args.stage, args.dpi, args.stage_count, args.color
         )
         if not args.apply:
-            emit({"ok": True, "dry_run": True, "before": config, "plan": plan}, as_json)
+            emit(
+                {"ok": True, "dry_run": True, "before": config, "plan": plan},
+                as_json,
+            )
             return 0
         path = save_backup(config, args.backup)
-        after, _ = write_and_verify(
+        after = write_and_verify(
             session,
             0x3A,
             0x00,
             payload,
-            {"dpi": {"dpi": args.dpi}},
+            [
+                {
+                    "kind": "dpi",
+                    "stage": plan["stage"],
+                    "stage_count": plan["stage_count"],
+                    "dpi": plan["dpi"],
+                    "color": plan["color"],
+                }
+            ],
+            backup=path,
         )
         emit(
             {
@@ -1015,23 +1896,33 @@ def command_set_dpi(args: argparse.Namespace, as_json: bool) -> int:
 
 
 def command_set_button(args: argparse.Namespace, as_json: bool) -> int:
+    if args.button not in BUTTON_NAMES:
+        raise ValueError(f"button must be one of {', '.join(BUTTON_NAMES)}")
+    index = BUTTON_NAMES.index(args.button)
     session = find_session()
     try:
         config, _ = read_config(session)
-        if args.button not in BUTTON_NAMES:
-            raise ValueError(f"button must be one of {', '.join(BUTTON_NAMES)}")
-        index = BUTTON_NAMES.index(args.button)
         pos, payload, plan = plan_button(index, args.action)
         if not args.apply:
-            emit({"ok": True, "dry_run": True, "before": config, "plan": plan}, as_json)
+            emit(
+                {"ok": True, "dry_run": True, "before": config, "plan": plan},
+                as_json,
+            )
             return 0
         path = save_backup(config, args.backup)
-        after, _ = write_and_verify(
+        after = write_and_verify(
             session,
             0x30,
             pos,
             payload,
-            {"button": {"index": index, "action": args.action}},
+            [
+                {
+                    "kind": "button",
+                    "index": index,
+                    "raw": tuple(payload),
+                }
+            ],
+            backup=path,
         )
         emit(
             {
@@ -1048,88 +1939,282 @@ def command_set_button(args: argparse.Namespace, as_json: bool) -> int:
         session.close()
 
 
+def command_restore(args: argparse.Namespace, as_json: bool) -> int:
+    source = os.path.abspath(os.path.expanduser(args.backup_file))
+    document = load_backup(source)
+    operations, plan = plan_restore(document)
+    if not args.apply:
+        emit(
+            {
+                "ok": True,
+                "dry_run": True,
+                "source": source,
+                "backup": source,
+                "plan": plan,
+            },
+            as_json,
+        )
+        return 0
+
+    session = find_session()
+    try:
+        current, _ = read_config(session)
+        path = save_backup(current)
+        try:
+            for operation in operations:
+                apply_write(
+                    session,
+                    operation["cmd"],
+                    operation["sub"],
+                    operation["payload"],
+                )
+            try:
+                after, _ = read_config(session)
+            except DeviceError as exc:
+                raise with_backup(exc, path)
+            expectations = [
+                operation["expected"] for operation in operations
+            ]
+            expectations.append(
+                {
+                    "kind": "dpi_current",
+                    "stage": plan["dpi"]["current_stage"],
+                }
+            )
+            verify_config(after, expectations, backup=path)
+        except DeviceError as exc:
+            raise with_backup(exc, path)
+        emit(
+            {
+                "ok": True,
+                "applied": True,
+                "backup": path,
+                "source": source,
+                "plan": plan,
+                "after": after,
+            },
+            as_json,
+        )
+        return 0
+    finally:
+        session.close()
+
+
 def command_battery(as_json: bool) -> int:
     result, _ = read_battery()
     emit(result, as_json)
     return 0
 
 
+class CliParser(argparse.ArgumentParser):
+    """Usage errors use exit 1 and honour --json when it was requested."""
+
+    json_hint = False
+
+    def parse_args(
+        self,
+        args: list[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> argparse.Namespace:
+        arguments = list(sys.argv[1:] if args is None else args)
+        set_json_hint(self, "--json" in arguments)
+        return super().parse_args(arguments, namespace)
+
+    def error(self, message: str) -> None:
+        if self.json_hint:
+            print(json.dumps({"ok": False, "error": message}))
+        else:
+            self.print_usage(sys.stderr)
+            print(f"{self.prog}: error: {message}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+def set_json_hint(parser: argparse.ArgumentParser, enabled: bool) -> None:
+    if isinstance(parser, CliParser):
+        parser.json_hint = enabled
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for child in action.choices.values():
+                set_json_hint(child, enabled)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Battery and settings helper for EWEADN S9 mice"
+    parser = CliParser(
+        description="Battery and settings helper for EWEADN S9 mice",
+        epilog=(
+            "Exit codes: 0 success, 1 validation/usage/IO error, "
+            "2 device not found, 3 permission denied, 4 no reply/asleep, "
+            "5 unexpected or unverified reply."
+        ),
     )
-    parser.add_argument("--json", action="store_true", dest="json_global")
+    parser.json_hint = "--json" in sys.argv[1:]
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_global",
+        help="print a JSON object (also available after a command)",
+    )
     sub = parser.add_subparsers(dest="command")
 
     battery = sub.add_parser("battery", help="read battery (default)")
-    battery.add_argument("--json", action="store_true", dest="json_sub")
+    battery.add_argument(
+        "--json", action="store_true", dest="json_sub", help="print JSON"
+    )
 
-    config = sub.add_parser("config", help="read polling, DPI, buttons and profile")
-    config.add_argument("--json", action="store_true", dest="json_sub")
-    config.add_argument("--debug", action="store_true")
+    config = sub.add_parser(
+        "config", help="read polling, DPI, buttons and profile"
+    )
+    config.add_argument(
+        "--json", action="store_true", dest="json_sub", help="print JSON"
+    )
+    config.add_argument(
+        "--debug",
+        action="store_true",
+        help="include raw protocol frames; implies --json",
+    )
 
     backup = sub.add_parser("backup", help="save a JSON configuration backup")
-    backup.add_argument("--json", action="store_true", dest="json_sub")
-    backup.add_argument("--output")
+    backup.add_argument(
+        "--json", action="store_true", dest="json_sub", help="print JSON"
+    )
+    backup.add_argument(
+        "--output",
+        metavar="PATH",
+        help="write the backup to PATH instead of the state directory",
+    )
+
+    restore = sub.add_parser(
+        "restore",
+        help="restore polling, all DPI stages and five buttons from a backup",
+    )
+    restore.add_argument(
+        "--backup",
+        required=True,
+        dest="backup_file",
+        metavar="PATH",
+        help="JSON backup created by the backup command",
+    )
+    restore.add_argument(
+        "--apply",
+        action="store_true",
+        help="write the restored settings; default is a dry run",
+    )
+    restore.add_argument(
+        "--json", action="store_true", dest="json_sub", help="print JSON"
+    )
 
     polling = sub.add_parser("set-polling", help="set the polling rate")
-    polling.add_argument("hz", type=int)
-    polling.add_argument("--wired", action="store_true")
-    polling.add_argument("--apply", action="store_true")
-    polling.add_argument("--backup")
-    polling.add_argument("--json", action="store_true", dest="json_sub")
+    polling.add_argument("hz", type=int, help="polling rate in Hz")
+    polling.add_argument(
+        "--wired",
+        action="store_true",
+        help="use the wired (USB cable) polling nibble",
+    )
+    polling.add_argument(
+        "--apply",
+        action="store_true",
+        help="write the setting; default is a dry run",
+    )
+    polling.add_argument(
+        "--backup",
+        metavar="PATH",
+        help="write the pre-change backup to PATH",
+    )
+    polling.add_argument(
+        "--json", action="store_true", dest="json_sub", help="print JSON"
+    )
 
     dpi = sub.add_parser("set-dpi", help="set a DPI stage")
-    dpi.add_argument("stage", type=int)
-    dpi.add_argument("dpi", type=int)
-    dpi.add_argument("--stage-count", type=int)
-    dpi.add_argument("--color")
-    dpi.add_argument("--apply", action="store_true")
-    dpi.add_argument("--backup")
-    dpi.add_argument("--json", action="store_true", dest="json_sub")
+    dpi.add_argument("stage", type=int, help="DPI stage number (1-8)")
+    dpi.add_argument("dpi", type=int, help="DPI value, a multiple of 50")
+    dpi.add_argument(
+        "--stage-count",
+        type=int,
+        help="number of active DPI stages (1-8)",
+    )
+    dpi.add_argument(
+        "--color",
+        metavar="#RRGGBB",
+        help="stage LED color; uses the current color when omitted",
+    )
+    dpi.add_argument(
+        "--apply",
+        action="store_true",
+        help="write the setting; default is a dry run",
+    )
+    dpi.add_argument(
+        "--backup",
+        metavar="PATH",
+        help="write the pre-change backup to PATH",
+    )
+    dpi.add_argument(
+        "--json", action="store_true", dest="json_sub", help="print JSON"
+    )
 
     button = sub.add_parser("set-button", help="remap one mouse button")
-    button.add_argument("button", choices=BUTTON_NAMES)
-    button.add_argument("action", choices=ACTION_NAMES)
-    button.add_argument("--apply", action="store_true")
-    button.add_argument("--backup")
-    button.add_argument("--json", action="store_true", dest="json_sub")
+    button.add_argument("button", choices=BUTTON_NAMES, help="button to remap")
+    button.add_argument("action", choices=ACTION_NAMES, help="new action")
+    button.add_argument(
+        "--apply",
+        action="store_true",
+        help="write the setting; default is a dry run",
+    )
+    button.add_argument(
+        "--backup",
+        metavar="PATH",
+        help="write the pre-change backup to PATH",
+    )
+    button.add_argument(
+        "--json", action="store_true", dest="json_sub", help="print JSON"
+    )
 
     return parser
 
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
-    as_json = bool(args.json_global or getattr(args, "json_sub", False))
+def emit_error(error: DeviceError, as_json: bool) -> int:
+    if as_json:
+        value: dict[str, object] = {"ok": False, "error": str(error)}
+        if error.backup:
+            value["backup"] = error.backup
+        print(json.dumps(value))
+    else:
+        print(f"eweadn-battery: {error}", file=sys.stderr)
+    return error.exit_code
 
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    set_json_hint(parser, "--json" in arguments)
+    args = parser.parse_args(arguments)
+    as_json = bool(
+        args.json_global
+        or getattr(args, "json_sub", False)
+        or getattr(args, "debug", False)
+    )
+
+    handlers = {
+        "battery": lambda: command_battery(as_json),
+        "config": lambda: command_config(args, as_json),
+        "backup": lambda: command_backup(args, as_json),
+        "restore": lambda: command_restore(args, as_json),
+        "set-polling": lambda: command_set_polling(args, as_json),
+        "set-dpi": lambda: command_set_dpi(args, as_json),
+        "set-button": lambda: command_set_button(args, as_json),
+    }
     try:
-        if args.command in (None, "battery"):
-            return command_battery(as_json)
-        if args.command == "config":
-            return command_config(args, as_json)
-        if args.command == "backup":
-            return command_backup(args, as_json)
-        if args.command == "set-polling":
-            return command_set_polling(args, as_json)
-        if args.command == "set-dpi":
-            return command_set_dpi(args, as_json)
-        if args.command == "set-button":
-            return command_set_button(args, as_json)
-        parser.error("unknown command")
+        handler = handlers.get(args.command or "battery")
+        if handler is None:
+            raise DeviceError(f"unknown command: {args.command}")
+        return handler()
     except DeviceError as exc:
-        if as_json:
-            print(json.dumps({"ok": False, "error": str(exc)}))
-        else:
-            print(f"eweadn-battery: {exc}", file=sys.stderr)
-        return exc.exit_code
+        return emit_error(exc, as_json)
+    except OSError as exc:
+        return emit_error(map_os_error(exc, "I/O error"), as_json)
     except ValueError as exc:
-        if as_json:
-            print(json.dumps({"ok": False, "error": str(exc)}))
-        else:
-            print(f"eweadn-battery: {exc}", file=sys.stderr)
-        return 1
-    return 0
+        return emit_error(DeviceError(str(exc)), as_json)
+    except Exception as exc:  # keep --json output machine-readable
+        return emit_error(DeviceError(f"unexpected error: {exc}"), as_json)
 
 
 if __name__ == "__main__":
