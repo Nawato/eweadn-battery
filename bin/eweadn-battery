@@ -742,6 +742,15 @@ def emit(value: dict, as_json: bool) -> None:
                     print(f"{value['name']}: {battery['percent']}%")
             elif "dpi" in value:
                 print_config(value)
+            elif value.get("dry_run"):
+                print("Dry run:", json.dumps(value.get("plan", {}), sort_keys=True))
+                print("Re-run with --apply to write this to the mouse.")
+            elif value.get("applied"):
+                print("Applied:", json.dumps(value.get("plan", {}), sort_keys=True))
+                if value.get("backup"):
+                    print("Backup:", value["backup"])
+            elif value.get("path") and value.get("config"):
+                print("Backup:", value["path"])
             else:
                 print(json.dumps(value, indent=2, sort_keys=True))
         else:
