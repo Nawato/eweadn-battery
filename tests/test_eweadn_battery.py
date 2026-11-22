@@ -170,6 +170,11 @@ class PlanWriteTest(unittest.TestCase):
         self.assertEqual(payload, bytes([5, 4, 1, 0]))
         self.assertEqual(plan["button"], "back")
 
+    def test_profile_cycle_payload(self) -> None:
+        pos, payload, _ = module.plan_button(4, "profile_cycle")
+        self.assertEqual(pos, 16)
+        self.assertEqual(payload, bytes([6, 5, 0, 0]))
+
 
 if __name__ == "__main__":
     unittest.main()
