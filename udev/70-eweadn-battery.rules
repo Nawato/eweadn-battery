@@ -1,0 +1,5 @@
+# EWEADN S9 8K receiver (372e:1026).
+# Grant the logged-in seat user access to the vendor HID interface only
+# (interface 2, usage page FF00), which is where the read-only battery
+# feature report lives.
+SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="372e", ENV{ID_MODEL_ID}=="1026", ENV{ID_USB_INTERFACE_NUM}=="02", MODE="0660", GROUP="users", TAG+="uaccess"

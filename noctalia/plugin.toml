@@ -1,0 +1,17 @@
+id = "nawato/eweadn-battery"
+name = "EWEADN Battery"
+version = "1.0.0"
+plugin_api = 24
+author = "nawato"
+license = "MIT"
+icon = "battery-4"
+description = "Battery level for the EWEADN S9 mouse over its 2.4 GHz receiver."
+dependencies = ["python"]
+
+[[widget]]
+id = "battery"
+entry = "widget.luau"
+
+[[service]]
+id = "monitor"
+entry = "service.luau"

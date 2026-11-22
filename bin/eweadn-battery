@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Read the battery level of an EWEADN S9 mouse from its 2.4 GHz receiver.
+
+The receiver exposes a 64-byte vendor feature report (report ID 3, usage page
+0xFF00).  The query was captured from EWEADN's own web driver and is also used
+by the Voltide project.  It is read-only: the only command sent is "get basic
+info".
+
+Protocol:
+    request: 03 20 50 00 00 4F 81 00 ...          (64 bytes, report ID first)
+    reply:   03 50 00 0B 00 01 <level> <status> ... A5 5A
+             byte 6 low 7 bits = percent, bit 7 = charging
+             charging reports the sentinel 0xE4, so no percentage is shown
+             while charging.
+
+Exit codes: 0 ok, 2 no device, 3 permission denied, 4 no reply/asleep,
+5 unexpected reply.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import glob
+import json
+import os
+import sys
+import time
+
+VID = 0x372E
+KNOWN_PIDS = {
+    0x1026,  # S9 Pro / S9 8K receiver
+    0x1027,  # S9 Ultra on its USB cable
+    0x1033,  # 1K receiver
+    0x103D,  # S9 Pro 1K receiver
+    0x1055,  # S9 Max / Ultra receiver
+    0x105E,  # S9 Max / Ultra receiver
+}
+CABLE_PIDS = {0x1027}
+
+REPORT_ID = 0x03
+FRAME_SIZE = 64
+HID_NAME_MATCH = "eweadn"
+
+
+def _ioc(direction: int, nr: int, size: int) -> int:
+    return (direction << 30) | (size << 16) | (ord("H") << 8) | nr
+
+
+HIDIOCSFEATURE = _ioc(3, 0x06, FRAME_SIZE)  # _IOWR('H', 0x06, 64)
+HIDIOCGFEATURE = _ioc(3, 0x07, FRAME_SIZE)  # _IOWR('H', 0x07, 64)
+
+
+def candidates() -> list[tuple[str, str, int, int]]:
+    """Return (device path, HID name, vendor, product) for EWEADN nodes."""
+    found: list[tuple[str, str, int, int]] = []
+    for uevent in glob.glob("/sys/class/hidraw/hidraw*/device/uevent"):
+        try:
+            with open(uevent, encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+
+        name = ""
+        hid_id = ""
+        for line in text.splitlines():
+            if line.startswith("HID_NAME="):
+                name = line.partition("=")[2]
+            elif line.startswith("HID_ID="):
+                hid_id = line.partition("=")[2]
+
+        parts = hid_id.split(":")
+        if len(parts) != 3:
+            continue
+        try:
+            vendor = int(parts[1], 16)
+            product = int(parts[2], 16)
+        except ValueError:
+            continue
+
+        if vendor != VID or product not in KNOWN_PIDS:
+            continue
+        if HID_NAME_MATCH not in name.lower() and product not in (0x1026, 0x1027):
+            continue
+
+        hidraw = os.path.basename(os.path.dirname(os.path.dirname(uevent)))
+        found.append(("/dev/" + hidraw, name, vendor, product))
+
+    found.sort()
+    return found
+
+
+def query_once(path: str) -> bytearray | None:
+    """Send the battery query and return a validated 64-byte reply."""
+    fd = os.open(path, os.O_RDWR)
+    try:
+        request = bytearray(FRAME_SIZE)
+        request[0] = REPORT_ID
+        request[1] = 0x20
+        request[2] = 0x50
+        request[5] = 0x4F
+        request[6] = 0x81
+        fcntl.ioctl(fd, HIDIOCSFEATURE, request)
+
+        # The receiver needs a moment to stage the answer.
+        time.sleep(0.06)
+
+        deadline = time.monotonic() + 0.20
+        while time.monotonic() < deadline:
+            reply = bytearray(FRAME_SIZE)
+            reply[0] = REPORT_ID
+            try:
+                fcntl.ioctl(fd, HIDIOCGFEATURE, reply)
+            except OSError:
+                time.sleep(0.008)
+                continue
+
+            if (
+                reply[0] == REPORT_ID
+                and reply[1] == 0x50
+                and reply[3] == 0x0B
+                and reply[13] == 0xA5
+                and reply[14] == 0x5A
+            ):
+                return reply
+            time.sleep(0.008)
+        return None
+    finally:
+        os.close(fd)
+
+
+def parse_reply(reply: bytes | bytearray) -> dict:
+    status_byte = reply[6]
+    charging = bool(status_byte & 0x80)
+    level = status_byte & 0x7F
+
+    if charging:
+        # On the cable the vendor firmware returns 0xE4 and the low bits are a
+        # sentinel, not a real level.  Report charging without a fake 100 %.
+        percent = None
+    else:
+        if level > 100:
+            raise ValueError(f"invalid battery level 0x{level:02X}")
+        percent = level
+
+    return {
+        "percent": percent,
+        "charging": charging,
+        "status": status_byte,
+        "raw": reply[:16].hex(" "),
+    }
+
+
+def read_battery() -> tuple[dict, int, str | None]:
+    """Try all EWEADN nodes and return (result, exit code, error)."""
+    nodes = candidates()
+    if not nodes:
+        return {}, 2, "EWEADN receiver not found"
+
+    permission_denied = False
+    got_reply = False
+    last_error = "no reply (mouse asleep or out of range)"
+
+    for path, name, _vendor, product in nodes:
+        for attempt in range(4):
+            if attempt:
+                time.sleep(0.14)
+            try:
+                reply = query_once(path)
+            except PermissionError:
+                permission_denied = True
+                break
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EPERM):
+                    permission_denied = True
+                    break
+                last_error = f"{type(exc).__name__}: {exc}"
+                continue
+
+            if reply is None:
+                continue
+
+            got_reply = True
+            try:
+                parsed = parse_reply(reply)
+            except ValueError as exc:
+                last_error = str(exc)
+                continue
+
+            parsed.update(
+                {
+                    "ok": True,
+                    "path": path,
+                    "name": name,
+                    "vendor": f"{VID:04x}",
+                    "product": f"{product:04x}",
+                    "source": "USB cable" if product in CABLE_PIDS else "2.4 GHz receiver",
+                }
+            )
+            return parsed, 0, None
+
+    if permission_denied:
+        return {}, 3, "permission denied (install the udev rule)"
+    if got_reply:
+        return {}, 5, last_error
+    return {}, 4, last_error
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Read EWEADN S9 mouse battery")
+    parser.add_argument("--json", action="store_true", help="print JSON")
+    args = parser.parse_args()
+
+    result, code, error = read_battery()
+
+    if args.json:
+        if code == 0:
+            print(json.dumps(result))
+        else:
+            print(json.dumps({"ok": False, "error": error}))
+    else:
+        if code == 0:
+            if result["charging"]:
+                print(f"{result['name']}: charging")
+            else:
+                print(f"{result['name']}: {result['percent']}%")
+        else:
+            print(f"eweadn-battery: {error}", file=sys.stderr)
+
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
