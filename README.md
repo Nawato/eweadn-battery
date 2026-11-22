@@ -108,15 +108,20 @@ and Noctalia is normally started by the compositor at login.
 
 ### Control panel
 
-Left-click the bar widget to open the panel. It shows battery, polling, current
-DPI, profile, and five button rows. Polling, DPI, and each button have their own
-**Apply** button; nothing is written just by changing a selection.
+Left-click the bar widget to open the panel as a dropdown attached to the bar,
+anchored near the widget. It shows battery, polling, current DPI, profile, and
+five button rows. Polling, DPI, and each button have their own **Apply** button;
+nothing is written just by changing a selection.
 
 **Profiles** are read-only on the S9. EWEADN's S9 SDK exposes the current/max
 profile number and supports binding a button to Profile 1–4 or Profile Cycle,
 but it has no direct "switch profile" command. Use the onboard profile button or
 the button mapping controls. (The web driver's direct profile switch only works
 on other mouse chipsets.)
+
+Noctalia panels are layer-shell surfaces, not toplevel windows. The dropdown is
+the native integration; a true resizable window would need a separate GTK/Qt
+frontend (not included).
 
 ## Usage
 
