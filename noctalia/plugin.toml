@@ -1,6 +1,6 @@
 id = "nawato/eweadn-battery"
 name = "EWEADN Battery"
-version = "1.0.0"
+version = "1.0.1"
 plugin_api = 52
 author = "nawato"
 license = "MIT"
