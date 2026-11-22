@@ -84,12 +84,14 @@ class ParseReplyTest(unittest.TestCase):
     def test_read_chunks_concatenates(self) -> None:
         class FakeSession:
             def query(self, cmd, sub, encap=0, **_kwargs):
-                return bytes([sub, encap]) + bytes(9), b""
+                return bytes([encap + 1]) + bytes([0xAA]) * 10, b""
 
         data = module.read_chunks(FakeSession(), 0x4F, 0x41, 40)
         self.assertEqual(len(data), 40)
-        self.assertEqual(data[:2], bytes([0x41, 0]))
-        self.assertEqual(data[11:13], bytes([0x42, 1]))
+        self.assertEqual(data[:2], bytes([1, 0xAA]))
+        self.assertEqual(data[10], 0xAA)
+        self.assertEqual(data[11], 0xAA)
+        self.assertNotEqual(data[10:12], bytes([2, 0xAA]))
 
 
 class ParseConfigTest(unittest.TestCase):
@@ -148,6 +150,20 @@ class ReadConfigTest(unittest.TestCase):
         product = 0x1026
         closed = False
 
+        @staticmethod
+        def package(data: bytes, total: int) -> list[bytes]:
+            chunks = [data[:11]]
+            cursor = 11
+            index = 1
+            while len(chunks[0]) + sum(len(c) - 1 for c in chunks[1:]) < total:
+                piece = data[cursor : cursor + 10]
+                if not piece:
+                    break
+                chunks.append(bytes([index]) + piece)
+                cursor += len(piece)
+                index += 1
+            return chunks
+
         def __init__(self):
             self.dpi = bytearray(64)
             for index, raw in enumerate([15, 31, 47, 63, 127, 255]):
@@ -156,15 +172,17 @@ class ReadConfigTest(unittest.TestCase):
                 self.dpi[17 + index * 3 : 20 + index * 3] = bytes(
                     [index * 20, 255 - index * 20, 128]
                 )
+            self.dpi_chunks = self.package(bytes(self.dpi), 64)
             self.keys = bytes(
                 [
                     1, 1, 1, 0,
                     1, 2, 1, 0,
                     1, 3, 1, 0,
-                    5, 4, 1, 0,
-                    0, 0, 0, 0,
+                    1, 5, 1, 0,
+                    1, 4, 1, 0,
                 ]
             )
+            self.key_chunks = self.package(self.keys, 48)
 
         def query(self, cmd, sub, data=b"", encap=0, **_kwargs):
             if cmd == 0x4F and sub == 0x81:
@@ -172,11 +190,9 @@ class ReadConfigTest(unittest.TestCase):
             if cmd == 0x4F and sub == 0x40:
                 return bytes.fromhex("02 66 36 01 03 40 20 10 01 01 00"), b""
             if cmd == 0x4F and 0x41 <= sub <= 0x47:
-                start = encap * 11
-                return bytes(self.dpi[start : start + 11]), b""
+                return (self.dpi_chunks[encap] if encap < len(self.dpi_chunks) else b""), b""
             if cmd == 0x4F and 0 <= sub <= 4:
-                start = encap * 11
-                return self.keys[start : start + 11], b""
+                return (self.key_chunks[encap] if encap < len(self.key_chunks) else b""), b""
             raise AssertionError((cmd, sub, encap))
 
         def close(self):
@@ -192,9 +208,10 @@ class ReadConfigTest(unittest.TestCase):
         self.assertEqual(config["dpi"]["max_dpi"], 30000)
         self.assertEqual(len(config["dpi"]["stages"]), 8)
         self.assertEqual(config["dpi"]["stages"][0]["dpi"], 800)
+        self.assertEqual(config["dpi"]["stages"][5]["dpi"], 12800)
         self.assertEqual(len(config["buttons"]), 5)
-        self.assertEqual(config["buttons"][3]["action"], "dpi_loop")
-        self.assertEqual(config["buttons"][4]["action"], "disabled")
+        self.assertEqual(config["buttons"][3]["action"], "back")
+        self.assertEqual(config["buttons"][4]["action"], "forward")
         self.assertEqual(config["profile"], {"current": 1, "max": 2, "sensor_current": 1})
 
 
