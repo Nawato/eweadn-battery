@@ -1,0 +1,48 @@
+name: Release
+
+"on":
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish source release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build source archive
+        run: |
+          archive="eweadn-battery-${GITHUB_REF_NAME}.tar.gz"
+          git archive \
+            --format=tar.gz \
+            --prefix="eweadn-battery-${GITHUB_REF_NAME}/" \
+            --output="$archive" \
+            "$GITHUB_REF_NAME"
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$ARCHIVE" --generate-notes --verify-tag
+          fi

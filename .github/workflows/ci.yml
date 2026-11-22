@@ -1,0 +1,55 @@
+name: CI
+
+"on":
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.14"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Lua and ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lua5.4 shellcheck
+
+      - name: Compile Python sources
+        run: python -m py_compile bin/eweadn-battery tests/test_eweadn_battery.py
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Check installer syntax
+        run: bash -n install.sh
+
+      - name: Lint installer
+        run: shellcheck install.sh
+
+      - name: Verify udev rules
+        run: udevadm verify udev/*.rules
+
+      - name: Parse Luau sources
+        run: |
+          for file in noctalia/*.luau; do
+            luac5.4 -p "$file"
+          done
+
+      - name: Check whitespace
+        run: git diff --check
