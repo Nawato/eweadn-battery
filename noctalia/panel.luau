@@ -421,6 +421,10 @@ end
 
 local function build_buttons()
 	local rows = {}
+	local label_width = 72
+	local select_width = 260
+	local apply_width = 64
+
 	for index, key in ipairs(config.buttons or {}) do
 		local draft = draft_buttons[index] or key.action
 		local options, selected = button_options(draft)
@@ -430,7 +434,7 @@ local function build_buttons()
 		table.insert(rows, ui.row({ gap = 8, align = "center" }, {
 			ui.label({
 				text = key.button,
-				width = 76,
+				width = label_width,
 				color = "on_surface_variant",
 			}),
 			ui.select({
@@ -444,12 +448,13 @@ local function build_buttons()
 					end
 					render()
 				end,
-				flexGrow = 1,
+				width = select_width,
 			}),
 			ui.button({
 				text = "Apply",
 				variant = changed and "primary" or "secondary",
 				enabled = changed and not busy,
+				width = apply_width,
 				onClick = function()
 					apply({
 						"set-button",
