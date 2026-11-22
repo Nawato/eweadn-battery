@@ -206,7 +206,7 @@ class ReadConfigTest(unittest.TestCase):
         self.assertEqual(config["polling"]["hz"], 2000)
         self.assertEqual(config["dpi"]["current_stage"], 3)
         self.assertEqual(config["dpi"]["max_dpi"], 30000)
-        self.assertEqual(len(config["dpi"]["stages"]), 8)
+        self.assertEqual(len(config["dpi"]["stages"]), 6)
         self.assertEqual(config["dpi"]["stages"][0]["dpi"], 800)
         self.assertEqual(config["dpi"]["stages"][5]["dpi"], 12800)
         self.assertEqual(len(config["buttons"]), 5)

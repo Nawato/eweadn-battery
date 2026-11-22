@@ -550,6 +550,7 @@ def read_config(session: HidSession | None = None) -> tuple[dict, dict]:
         basics = parse_basics(basics_data)
         sensor = parse_sensor(sensor_data)
         max_dpi = basics["max_dpi"] or 30000
+        stages = parse_dpi(dpi_data, max_dpi)[: sensor["stage_count"]]
         wired = session.product in CABLE_PIDS
         rate_code = (
             sensor["wired_rate_code"] if wired else sensor["wireless_rate_code"]
@@ -577,7 +578,7 @@ def read_config(session: HidSession | None = None) -> tuple[dict, dict]:
                 "max_dpi": max_dpi,
                 "current_stage": sensor["current_stage"],
                 "stage_count": sensor["stage_count"],
-                "stages": parse_dpi(dpi_data, max_dpi),
+                "stages": stages,
             },
             "buttons": parse_keys(keys_data),
             "profile": {
