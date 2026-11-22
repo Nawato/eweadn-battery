@@ -7,16 +7,16 @@ official web driver and the @bytech/mouse-pix SDK.
 
 Battery output is backwards compatible with the original helper:
 
-    eweadn-battery --json
+    eweadn-linux-control --json
 
 New commands:
 
-    eweadn-battery config --json
-    eweadn-battery set-polling 8000 --apply
-    eweadn-battery set-dpi 1 1600 --apply
-    eweadn-battery set-button back dpi_loop --apply
-    eweadn-battery backup
-    eweadn-battery restore --backup FILE --apply
+    eweadn-linux-control config --json
+    eweadn-linux-control set-polling 8000 --apply
+    eweadn-linux-control set-dpi 1 1600 --apply
+    eweadn-linux-control set-button back dpi_loop --apply
+    eweadn-linux-control backup
+    eweadn-linux-control restore --backup FILE --apply
 
 Writes are dry-run unless --apply is passed.  Every applied write saves the
 current configuration first and reads it back afterwards.
@@ -387,8 +387,8 @@ def _verified_runtime_dir() -> str | None:
 def lock_path() -> str:
     runtime = _verified_runtime_dir()
     if runtime:
-        return os.path.join(runtime, "eweadn-battery.lock")
-    return os.path.join(state_home(), "eweadn-battery", "lock")
+        return os.path.join(runtime, "eweadn-linux-control.lock")
+    return os.path.join(state_home(), "eweadn-linux-control", "lock")
 
 
 def release_lock(fd: int | None) -> None:
@@ -430,7 +430,7 @@ def acquire_lock() -> int:
             except BlockingIOError as exc:
                 if time.monotonic() >= deadline:
                     raise LockError(
-                        "another eweadn-battery process is busy "
+                        "another eweadn-linux-control process is busy "
                         f"(lock {path})"
                     ) from exc
                 time.sleep(LOCK_RETRY)
@@ -1091,7 +1091,7 @@ def read_config(session: HidSession | None = None) -> tuple[dict, dict]:
 
 
 def backup_directory() -> str:
-    return os.path.join(state_home(), "eweadn-battery", "backups")
+    return os.path.join(state_home(), "eweadn-linux-control", "backups")
 
 
 def _next_backup_target(directory: str) -> str:
@@ -1162,7 +1162,7 @@ def save_backup(config: dict, path: str | None = None) -> str:
 
         payload = json.dumps(config, indent=2, sort_keys=True) + "\n"
         fd, temp_path = tempfile.mkstemp(
-            prefix=".eweadn-battery-", suffix=".tmp", dir=directory
+            prefix=".eweadn-linux-control-", suffix=".tmp", dir=directory
         )
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -1720,7 +1720,7 @@ def emit(value: dict, as_json: bool) -> None:
                 print(json.dumps(value, indent=2, sort_keys=True))
         else:
             print(
-                f"eweadn-battery: {value.get('error', 'unknown error')}",
+                f"eweadn-linux-control: {value.get('error', 'unknown error')}",
                 file=sys.stderr,
             )
 
@@ -2040,7 +2040,7 @@ def set_json_hint(parser: argparse.ArgumentParser, enabled: bool) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = CliParser(
-        description="Battery and settings helper for EWEADN S9 mice",
+        description="Linux control helper for EWEADN mice (battery, polling, DPI, buttons)",
         epilog=(
             "Exit codes: 0 success, 1 validation/usage/IO error, "
             "2 device not found, 3 permission denied, 4 no reply/asleep, "
@@ -2178,7 +2178,7 @@ def emit_error(error: DeviceError, as_json: bool) -> int:
             value["backup"] = error.backup
         print(json.dumps(value))
     else:
-        print(f"eweadn-battery: {error}", file=sys.stderr)
+        print(f"eweadn-linux-control: {error}", file=sys.stderr)
     return error.exit_code
 
 

@@ -1,10 +1,11 @@
-# eweadn-battery
+# eweadn-linux-control
 
-[![CI](https://github.com/Nawato/eweadn-battery/actions/workflows/ci.yml/badge.svg)](https://github.com/Nawato/eweadn-battery/actions/workflows/ci.yml)
+[![CI](https://github.com/Nawato/eweadn-linux-control/actions/workflows/ci.yml/badge.svg)](https://github.com/Nawato/eweadn-linux-control/actions/workflows/ci.yml)
 
-Linux battery and settings control for **EWEADN S9-series wireless mice** over
-the 2.4 GHz receiver or USB cable, with a **Noctalia bar widget and control
-panel**. Battery level is also read over Bluetooth through BlueZ.
+Linux control for **EWEADN mice** over the 2.4 GHz receiver or USB cable,
+with a **Noctalia bar widget and control panel**. Battery level is also read
+over Bluetooth through BlueZ. Currently covers the **S9 series**; the layout
+leaves room for more models and settings.
 
 The mouse/receiver does not expose a standard HID battery usage or a
 `power_supply` device, so UPower cannot see it. This project talks directly to
@@ -58,7 +59,7 @@ Bluetooth mode the widget still shows the battery level, but the panel replaces
 polling/DPI/button controls with a settings-unavailable message.
 
 The helper only considers BlueZ devices whose name contains `EWEADN`. It reads
-only the `Battery Percentage` property, so `eweadn-battery --json` over
+only the `Battery Percentage` property, so `eweadn-linux-control --json` over
 Bluetooth includes `"charging_known": false`.
 
 ## Requirements
@@ -73,17 +74,25 @@ Bluetooth includes `"charging_known": false`.
 ## Install
 
 ```sh
-git clone https://github.com/Nawato/eweadn-battery.git
-cd eweadn-battery
-./install.sh
+git clone https://github.com/Nawato/eweadn-linux-control.git
+cd eweadn-linux-control
+./install.sh                 # helper + Noctalia plugin
+./install.sh --cli-only      # helper only (no plugin files)
+./install.sh --plugin-only   # plugin files only (helper must exist separately)
 ```
 
-The installer writes the helper to `~/.local/bin/eweadn-battery` and the plugin
-to `${NOCTALIA_DATA_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}}/noctalia/plugins/eweadn-battery/`.
+The installer writes the helper to `~/.local/bin/eweadn-linux-control` and the plugin
+to `${NOCTALIA_DATA_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}}/noctalia/plugins/eweadn-linux-control/`.
 It looks for the Noctalia config at
 `${NOCTALIA_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}}/noctalia/config.toml`.
 `NOCTALIA_DATA_HOME` and `NOCTALIA_CONFIG_HOME` take precedence over the XDG
 variables and are home roots, so the `noctalia/` component is still appended.
+Components missing from the bundle are skipped, so the same script installs the
+full checkout, the CLI-only bundle, and the Noctalia bundle (see Releases).
+
+The installer also creates a compatibility symlink
+`~/.local/bin/eweadn-battery` when that path does not exist yet, so old
+configs keep working until you migrate them.
 
 The installer never calls `sudo`. If the udev rule is missing or differs from
 the bundled copy, it prints the exact commands to run. The comparison is
@@ -96,7 +105,7 @@ The receiver's vendor HID interface is root-only by default. Install the rule
 once:
 
 ```sh
-sudo install -Dm644 udev/70-eweadn-battery.rules /etc/udev/rules.d/70-eweadn-battery.rules
+sudo install -Dm644 udev/70-eweadn-linux-control.rules /etc/udev/rules.d/70-eweadn-linux-control.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=hidraw
 ```
@@ -111,7 +120,7 @@ If the permission does not appear, unplug and replug the receiver. Verify:
 
 ```sh
 getfacl /dev/hidraw9    # node number may differ; look for a user: ACL
-eweadn-battery --json
+eweadn-linux-control --json
 ```
 
 If a unit enumerates its vendor interface differently, adjust its rule line.
@@ -139,7 +148,7 @@ Verify BlueZ exposes a battery level:
 
 ```sh
 bluetoothctl info XX:XX:XX:XX:XX:XX | grep -i 'Battery Percentage'
-eweadn-battery --json
+eweadn-linux-control --json
 ```
 
 The helper tries connected BlueZ devices whose name contains `EWEADN` and reads
@@ -153,10 +162,10 @@ Add the plugin and widget to `~/.config/noctalia/config.toml`:
 
 ```toml
 [plugins]
-enabled = [ "nawato/eweadn-battery" ]
+enabled = [ "nawato/eweadn-linux-control" ]
 
 [widget.mouse_battery]
-type = "nawato/eweadn-battery:battery"
+type = "nawato/eweadn-linux-control:battery"
 ```
 
 Then place `mouse_battery` in the bar where you want it, for example:
@@ -208,23 +217,23 @@ resizable window would need a separate GTK/Qt frontend (not included).
 ## Usage
 
 ```sh
-eweadn-battery                    # battery, human-readable
-eweadn-battery --json             # battery, stable JSON
-eweadn-battery config             # polling, DPI stages, buttons, profile
-eweadn-battery config --json      # same as JSON
-eweadn-battery config --debug     # raw protocol frames; implies --json
-eweadn-battery backup             # save a config backup
-eweadn-battery backup --output PATH
-eweadn-battery restore --backup PATH            # dry run
-eweadn-battery restore --backup PATH --apply    # write the backup back
+eweadn-linux-control                    # battery, human-readable
+eweadn-linux-control --json             # battery, stable JSON
+eweadn-linux-control config             # polling, DPI stages, buttons, profile
+eweadn-linux-control config --json      # same as JSON
+eweadn-linux-control config --debug     # raw protocol frames; implies --json
+eweadn-linux-control backup             # save a config backup
+eweadn-linux-control backup --output PATH
+eweadn-linux-control restore --backup PATH            # dry run
+eweadn-linux-control restore --backup PATH --apply    # write the backup back
 ```
 
 Writes are dry-run by default. Add `--apply` to change the mouse:
 
 ```sh
-eweadn-battery set-polling 8000 --apply
-eweadn-battery set-dpi 1 1600 --apply
-eweadn-battery set-button back dpi_loop --apply
+eweadn-linux-control set-polling 8000 --apply
+eweadn-linux-control set-dpi 1 1600 --apply
+eweadn-linux-control set-button back dpi_loop --apply
 ```
 
 Supported polling rates are 125, 250, 500, 1000, 2000, 4000, and 8000 Hz.
@@ -261,8 +270,8 @@ the active DPI stage and uses the backup's saved wired/wireless polling
 transport.
 
 Backups are written atomically with mode `0600`. Automatic backups live in a
-private `0700` directory under `$XDG_STATE_HOME/eweadn-battery/backups/`
-(default: `~/.local/state/eweadn-battery/backups/`) and use timestamped names
+private `0700` directory under `$XDG_STATE_HOME/eweadn-linux-control/backups/`
+(default: `~/.local/state/eweadn-linux-control/backups/`) and use timestamped names
 that never replace an existing file; an explicit `--backup`/`--output` path is
 replaced atomically. `restore --apply` also saves a safety backup of the
 current configuration before writing.
@@ -271,7 +280,7 @@ If a write or read-back fails after a backup was saved, the error message and
 JSON output include the backup path. Restore that file with:
 
 ```sh
-eweadn-battery restore --backup PATH --apply
+eweadn-linux-control restore --backup PATH --apply
 ```
 
 The Noctalia panel exposes the same polling, DPI, and button writes with Apply
@@ -298,7 +307,7 @@ Example battery JSON:
 Force the Noctalia service to poll without waiting:
 
 ```sh
-noctalia msg plugin nawato/eweadn-battery:monitor all refresh
+noctalia msg plugin nawato/eweadn-linux-control:monitor all refresh
 ```
 
 Exit codes: `0` success, `1` validation/usage/IO, lock, backup or restore
@@ -348,8 +357,8 @@ because EWEADN's driver does not support that. Bluetooth charging state is not
 reported.
 
 Vendor HID access is serialized by a `0600` lock file under
-`$XDG_RUNTIME_DIR/eweadn-battery.lock`, or under
-`$XDG_STATE_HOME/eweadn-battery/lock` when the runtime directory is unavailable
+`$XDG_RUNTIME_DIR/eweadn-linux-control.lock`, or under
+`$XDG_STATE_HOME/eweadn-linux-control/lock` when the runtime directory is unavailable
 or untrusted. The lock wait is bounded at about 1.5 seconds, and device
 enumeration is repeated after the lock is acquired.
 
@@ -386,12 +395,12 @@ battery level; use the receiver or cable for battery telemetry. Charging state
 is not available over Bluetooth.
 
 **Widget shows `--`** — Noctalia has not received a reading yet. Check
-`~/.cache/noctalia/noctalia.log` and run `eweadn-battery --json`.
+`~/.cache/noctalia/noctalia.log` and run `eweadn-linux-control --json`.
 
 **A write says "verification failed"** — the mouse did not store the value, or
 it answered with a different setting. The pre-write JSON backup path is in the
 error and in the JSON `backup` field; restore it with
-`eweadn-battery restore --backup PATH --apply`. Move the mouse to wake it
+`eweadn-linux-control restore --backup PATH --apply`. Move the mouse to wake it
 before retrying.
 
 ## Development / CI
@@ -399,7 +408,7 @@ before retrying.
 Run the same checks as CI:
 
 ```sh
-python -m py_compile bin/eweadn-battery tests/test_eweadn_battery.py
+python -m py_compile bin/eweadn-linux-control tests/test_eweadn_linux_control.py
 python -m unittest discover -s tests -v
 bash -n install.sh
 shellcheck install.sh
@@ -412,22 +421,46 @@ git diff --check
 
 GitHub Actions runs CI on pushes and pull requests with Python 3.10, 3.12, and
 3.14 on `ubuntu-latest`, installing `lua5.4` and `shellcheck`
-(`.github/workflows/ci.yml`). Pushing a `v*` tag runs the tests, builds a
-source archive named `eweadn-battery-<tag>.tar.gz`, and creates the GitHub
-release with generated notes or uploads/replaces the archive on an existing
-release (`.github/workflows/release.yml`).
+(`.github/workflows/ci.yml`). Pushing a `v*` tag runs the tests and publishes
+three bundles (`.github/workflows/release.yml`):
+
+- `eweadn-linux-control-<tag>.tar.gz` — full source archive
+- `eweadn-linux-control-cli-<tag>.tar.gz` — CLI-only bundle (`bin/`, `udev/`,
+  `install.sh`, docs)
+- `eweadn-linux-control-noctalia-<tag>.tar.gz` — complete Noctalia bundle
+  (`noctalia/` plus the helper it shells out to, `udev/`, `install.sh`, docs)
+
+The release is created with generated notes, or the three archives are
+uploaded/replaced on an existing release.
+
+### Migrating from `eweadn-battery` (pre-2.0)
+
+Version 2.0 renames the project to `eweadn-linux-control`:
+
+- Binary: `~/.local/bin/eweadn-battery` → `~/.local/bin/eweadn-linux-control`
+  (the installer leaves a compatibility symlink behind).
+- Plugin ID: `nawato/eweadn-battery` → `nawato/eweadn-linux-control`, installed
+  to `.../noctalia/plugins/eweadn-linux-control/`. Update `config.toml` and
+  remove the legacy plugin directory once the new ID is active.
+- udev rule: `/etc/udev/rules.d/70-eweadn-battery.rules` →
+  `/etc/udev/rules.d/70-eweadn-linux-control.rules`. Install the new rule, then
+  delete the legacy file and reload udev.
+- State: `$XDG_STATE_HOME/eweadn-battery/` →
+  `$XDG_STATE_HOME/eweadn-linux-control/` (backups, lock fallback), and the
+  runtime lock is now `eweadn-linux-control.lock`. Old JSON backups stay valid
+  files — pass them explicitly with `restore --backup PATH`.
 
 Layout:
 
 ```text
-bin/eweadn-battery        HID helper, CLI, backup and restore
-noctalia/plugin.toml      Noctalia plugin manifest (API 52, python3)
-noctalia/service.luau     30-second poller and low-battery notification
-noctalia/widget.luau      bar widget
-noctalia/panel.luau       attached polling/DPI/button control panel
-udev/                     hidraw permission rule
-tests/                    protocol, discovery, fallback, backup/restore and lock tests
-.github/workflows/        CI and tag-triggered release
+bin/eweadn-linux-control   HID helper, CLI, backup and restore
+noctalia/plugin.toml       Noctalia plugin manifest (API 52, python3)
+noctalia/service.luau      30-second poller and low-battery notification
+noctalia/widget.luau       bar widget
+noctalia/panel.luau        attached polling/DPI/button control panel
+udev/                      hidraw permission rule
+tests/                     protocol, discovery, fallback, backup/restore and lock tests
+.github/workflows/         CI and tag-triggered release (source, CLI, Noctalia bundles)
 ```
 
 ## License

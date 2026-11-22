@@ -125,7 +125,7 @@ noctalia.state.watch("battery", render)
 render(noctalia.state.get("battery"))
 
 function onClick()
-	noctalia.togglePanel("nawato/eweadn-battery:control")
+	noctalia.togglePanel("nawato/eweadn-linux-control:control")
 end
 
 function onRightClick()

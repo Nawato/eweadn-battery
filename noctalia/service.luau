@@ -3,7 +3,7 @@
 -- The service is loaded with the plugin, so it starts automatically with
 -- Noctalia and keeps running even if the widget is not on a bar.
 
-local HELPER = noctalia.expandPath("~/.local/bin/eweadn-battery")
+local HELPER = noctalia.expandPath("~/.local/bin/eweadn-linux-control")
 local POLL_MS = 30000
 local LOW_PERCENT = 15
 

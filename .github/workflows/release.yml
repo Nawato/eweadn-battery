@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   release:
-    name: Publish source release
+    name: Publish release bundles
     runs-on: ubuntu-latest
 
     steps:
@@ -27,22 +27,54 @@ jobs:
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
 
-      - name: Build source archive
+      - name: Build release bundles
         run: |
-          archive="eweadn-battery-${GITHUB_REF_NAME}.tar.gz"
+          tag="${GITHUB_REF_NAME}"
+          full="eweadn-linux-control-${tag}.tar.gz"
+          cli="eweadn-linux-control-cli-${tag}.tar.gz"
+          plugin="eweadn-linux-control-noctalia-${tag}.tar.gz"
+
+          # Full source archive.
           git archive \
             --format=tar.gz \
-            --prefix="eweadn-battery-${GITHUB_REF_NAME}/" \
-            --output="$archive" \
-            "$GITHUB_REF_NAME"
-          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+            --prefix="eweadn-linux-control-${tag}/" \
+            --output="$full" \
+            "$tag"
+
+          # CLI-only bundle: helper, udev rule, installer and docs.
+          rm -rf stage-cli
+          mkdir -p "stage-cli/eweadn-linux-control-cli-${tag}/bin"
+          mkdir -p "stage-cli/eweadn-linux-control-cli-${tag}/udev"
+          cp -a bin/eweadn-linux-control "stage-cli/eweadn-linux-control-cli-${tag}/bin/"
+          cp -a udev/70-eweadn-linux-control.rules "stage-cli/eweadn-linux-control-cli-${tag}/udev/"
+          cp -a install.sh README.md LICENSE "stage-cli/eweadn-linux-control-cli-${tag}/"
+          tar -czf "$cli" -C stage-cli "eweadn-linux-control-cli-${tag}"
+          rm -rf stage-cli
+
+          # Complete Noctalia bundle: plugin plus the helper it shells out to,
+          # the udev rule, the installer and docs.
+          rm -rf stage-noctalia
+          mkdir -p "stage-noctalia/eweadn-linux-control-noctalia-${tag}/bin"
+          mkdir -p "stage-noctalia/eweadn-linux-control-noctalia-${tag}/udev"
+          mkdir -p "stage-noctalia/eweadn-linux-control-noctalia-${tag}/noctalia"
+          cp -a bin/eweadn-linux-control "stage-noctalia/eweadn-linux-control-noctalia-${tag}/bin/"
+          cp -a udev/70-eweadn-linux-control.rules "stage-noctalia/eweadn-linux-control-noctalia-${tag}/udev/"
+          cp -a noctalia/plugin.toml noctalia/service.luau noctalia/widget.luau noctalia/panel.luau \
+            "stage-noctalia/eweadn-linux-control-noctalia-${tag}/noctalia/"
+          cp -a install.sh README.md LICENSE "stage-noctalia/eweadn-linux-control-noctalia-${tag}/"
+          tar -czf "$plugin" -C stage-noctalia "eweadn-linux-control-noctalia-${tag}"
+          rm -rf stage-noctalia
+
+          echo "FULL_ARCHIVE=$full" >> "$GITHUB_ENV"
+          echo "CLI_ARCHIVE=$cli" >> "$GITHUB_ENV"
+          echo "PLUGIN_ARCHIVE=$plugin" >> "$GITHUB_ENV"
 
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber
+            gh release upload "$GITHUB_REF_NAME" "$FULL_ARCHIVE" "$CLI_ARCHIVE" "$PLUGIN_ARCHIVE" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" "$ARCHIVE" --generate-notes --verify-tag
+            gh release create "$GITHUB_REF_NAME" "$FULL_ARCHIVE" "$CLI_ARCHIVE" "$PLUGIN_ARCHIVE" --generate-notes --verify-tag
           fi

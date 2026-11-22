@@ -17,9 +17,9 @@ import unittest
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-HELPER = ROOT / "bin" / "eweadn-battery"
+HELPER = ROOT / "bin" / "eweadn-linux-control"
 
-loader = importlib.machinery.SourceFileLoader("eweadn_battery", str(HELPER))
+loader = importlib.machinery.SourceFileLoader("eweadn_linux_control", str(HELPER))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 assert spec is not None
 module = importlib.util.module_from_spec(spec)
@@ -883,7 +883,7 @@ class BackupRestoreTest(unittest.TestCase):
                 path = module.save_backup({"ok": True, "value": 7})
             self.assertTrue(os.path.isfile(path))
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
-            backups = os.path.join(state, "eweadn-battery", "backups")
+            backups = os.path.join(state, "eweadn-linux-control", "backups")
             self.assertEqual(stat.S_IMODE(os.stat(backups).st_mode), 0o700)
             with open(path, encoding="utf-8") as handle:
                 self.assertEqual(
@@ -1088,7 +1088,7 @@ class LockTest(unittest.TestCase):
         with mock.patch.dict(os.environ, self.env, clear=False):
             self.assertEqual(
                 module.lock_path(),
-                os.path.join(self.runtime, "eweadn-battery.lock"),
+                os.path.join(self.runtime, "eweadn-linux-control.lock"),
             )
 
     def test_unverified_runtime_falls_back_to_state_directory(self) -> None:
@@ -1097,7 +1097,7 @@ class LockTest(unittest.TestCase):
             self.assertEqual(
                 module.lock_path(),
                 os.path.join(
-                    self.state, "eweadn-battery", "lock"
+                    self.state, "eweadn-linux-control", "lock"
                 ),
             )
 
@@ -1167,7 +1167,7 @@ class LockTest(unittest.TestCase):
     def test_symlink_lock_is_rejected(self) -> None:
         target = os.path.join(self.runtime, "target")
         pathlib.Path(target).write_text("x", encoding="utf-8")
-        os.symlink(target, os.path.join(self.runtime, "eweadn-battery.lock"))
+        os.symlink(target, os.path.join(self.runtime, "eweadn-linux-control.lock"))
         with mock.patch.dict(os.environ, self.env, clear=False):
             with self.assertRaises(module.LockError):
                 module.acquire_lock()

@@ -1,11 +1,11 @@
-id = "nawato/eweadn-battery"
-name = "EWEADN Battery"
-version = "1.0.1"
+id = "nawato/eweadn-linux-control"
+name = "EWEADN Linux Control"
+version = "2.0.0"
 plugin_api = 52
 author = "nawato"
 license = "MIT"
 icon = "battery-4"
-description = "Battery, polling, DPI and button controls for the EWEADN S9 mouse."
+description = "Battery, polling, DPI and button controls for EWEADN mice on Linux."
 dependencies = ["python3"]
 
 [[widget]]

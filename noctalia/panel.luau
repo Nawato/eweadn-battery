@@ -3,7 +3,7 @@
 -- polling/DPI/button changes through the helper. Profiles are read-only on
 -- the S9 because its vendor SDK has no direct profile-switch command.
 
-local HELPER = noctalia.expandPath("~/.local/bin/eweadn-battery")
+local HELPER = noctalia.expandPath("~/.local/bin/eweadn-linux-control")
 
 local POLL_VALUES = { 125, 250, 500, 1000, 2000, 4000, 8000 }
 
