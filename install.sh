@@ -39,7 +39,7 @@ EOF
 	echo
 fi
 
-if [[ -f /etc/udev/rules.d/70-eweadn-battery.rules ]]; then
+if grep -q '1027' /etc/udev/rules.d/70-eweadn-battery.rules 2>/dev/null; then
 	echo "The udev rule is already installed."
 else
 	echo "Install the udev rule (required for the 2.4 GHz receiver):"
