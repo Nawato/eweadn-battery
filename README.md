@@ -1,19 +1,23 @@
 # eweadn-battery
 
-Linux battery monitoring for **EWEADN S9-series wireless mice** over their
-2.4 GHz receiver, with a **Noctalia bar widget**.
+Linux battery and settings control for **EWEADN S9-series wireless mice** over
+their 2.4 GHz receiver, with a **Noctalia bar widget and control panel**.
 
 The mouse/receiver does not expose a standard HID battery usage or a
-`power_supply` device, so UPower cannot see it. This project sends the same
-read-only vendor feature report that EWEADN's web driver uses, then publishes
-the result to Noctalia.
+`power_supply` device, so UPower cannot see it. This project talks directly to
+the vendor HID interface, using the same protocol as EWEADN's web driver.
 
 - Battery percentage in the Noctalia bar
+- Control panel: polling rate, DPI stage/value, and button remapping
 - Charging state and a `?` marker when the last reading is stale
 - Low-battery notification at 15 %
-- Left-click the widget to refresh immediately
+- Left-click the widget for the panel; right-click forces a refresh
 - Polls every 30 seconds; starts with Noctalia
 - No vendor software and no Bluetooth mode required
+
+Writes are explicit: the helper dry-runs unless `--apply` is passed, saves a
+JSON backup before every write, and verifies the result by reading it back.
+Profile switching is read-only on the S9 (see below).
 
 ## Supported hardware
 
@@ -28,9 +32,9 @@ The protocol is confirmed on `372e:1026` and `372e:103d`. Other receiver IDs
 are included because they share the same S9 protocol, but they have not all
 been tested.
 
-The bundled udev rule matches `372e:1026` (the 8K receiver). If you use a
-different receiver, replace `ID_MODEL_ID` in the rule with the ID reported by
-`lsusb`.
+The bundled udev rule matches `372e:1026` (the 8K receiver) and `372e:1027`
+(USB-cable mode). If you use a different receiver, add its ID from `lsusb` to
+the rule as another `ID_MODEL_ID` line.
 
 ## Requirements
 
@@ -101,14 +105,48 @@ noctalia msg config-reload
 No separate autostart is needed: the plugin service is loaded with Noctalia,
 and Noctalia is normally started by the compositor at login.
 
+### Control panel
+
+Left-click the bar widget to open the panel. It shows battery, polling, current
+DPI, profile, and five button rows. Polling, DPI, and each button have their own
+**Apply** button; nothing is written just by changing a selection.
+
+**Profiles** are read-only on the S9. EWEADN's S9 SDK exposes the current/max
+profile number and supports binding a button to Profile 1–4 or Profile Cycle,
+but it has no direct "switch profile" command. Use the onboard profile button or
+the button mapping controls. (The web driver's direct profile switch only works
+on other mouse chipsets.)
+
 ## Usage
 
 ```sh
-eweadn-battery           # human-readable
-eweadn-battery --json    # stable JSON for scripts
+eweadn-battery                 # battery, human-readable
+eweadn-battery --json          # battery, stable JSON
+eweadn-battery config          # polling, DPI stages, buttons, profile
+eweadn-battery config --json   # same as JSON
+eweadn-battery backup          # save a config backup
 ```
 
-Example:
+Writes are dry-run by default. Add `--apply` to change the mouse:
+
+```sh
+eweadn-battery set-polling 8000 --apply
+eweadn-battery set-dpi 1 1600 --apply
+eweadn-battery set-button back dpi_loop --apply
+```
+
+`set-button` accepts:
+
+`left`, `right`, `middle`, `back`, `forward`, `dpi_up`, `dpi_down`,
+`dpi_loop`, `profile_1`…`profile_4`, `profile_cycle`,
+`media_play_pause`, `media_next`, `media_prev`, `media_mute`,
+`volume_up`, `volume_down`, `disabled`.
+
+The Noctalia panel exposes the same operations with Apply buttons. Each write
+saves a backup under `~/.local/state/eweadn-battery/backups/` and is verified by
+reading the config back from the mouse.
+
+Example battery JSON:
 
 ```json
 {"percent":100,"charging":false,"status":100,"raw":"03 50 00 0b 00 01 64 21 07 02 30 75 04 a5 5a 00","ok":true,"path":"/dev/hidraw9","name":"Gaming Mouse 8K EWEADN S9","vendor":"372e","product":"1026","source":"2.4 GHz receiver"}
@@ -139,6 +177,20 @@ While charging, the firmware reports `0xE4` and the low bits are not a real
 level, so the helper returns `"percent": null` and the widget displays
 **Charging** instead of a fake 100 %.
 
+Settings use the same feature report with command/offset bytes:
+
+| Operation | Command | Payload |
+| --- | --- | --- |
+| sensor info | `0x4F 0x40` | none |
+| DPI table | `0x4F 0x41` | none |
+| button table | `0x4F 0x00` | none |
+| set polling | `0x35 0x01` | 1 byte, wireless low nibble / wired high nibble |
+| set DPI | `0x3A 0x00` | stage/count, 16-bit DPI, RGB |
+| set button | `0x30 <key-pos>` | type, code, times, gap |
+
+The exact key-position values and DPI encoding come from
+`@bytech/mouse-pix` 1.11.1.
+
 The mouse sleeps when idle, so a poll can time out. The Noctalia widget keeps
 the last value, marks it with `?`, and shows the last-update time and error in
 its tooltip.
@@ -160,6 +212,11 @@ widget or run the refresh command.
 **Widget shows `--`** — Noctalia has not received a reading yet. Check
 `~/.cache/noctalia/noctalia.log` and run `eweadn-battery --json`.
 
+**A write says “verification failed”** — the mouse did not store the value, or
+it answered with a different setting. The pre-write JSON backup is printed in
+the error; keep EWEADN's web driver handy to restore a value if needed. Move the
+mouse to wake it before retrying.
+
 ## Development
 
 ```sh
@@ -169,12 +226,13 @@ python3 -m unittest discover -s tests -v
 Layout:
 
 ```text
-bin/eweadn-battery        read-only HID helper
+bin/eweadn-battery        HID helper and settings writer
 noctalia/plugin.toml      Noctalia plugin manifest
 noctalia/service.luau     30-second poller and low-battery notification
 noctalia/widget.luau      bar widget
+noctalia/panel.luau       polling/DPI/button control panel
 udev/                     hidraw permission rule
-tests/                    parser and ioctl tests
+tests/                    parser, planner and ioctl tests
 ```
 
 ## License
