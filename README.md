@@ -57,9 +57,9 @@ EWEADN's driver explicitly does not support settings over Bluetooth. In
 Bluetooth mode the widget still shows the battery level, but the panel replaces
 polling/DPI/button controls with a settings-unavailable message.
 
-The helper only considers BlueZ devices whose name contains `EWEADN`. BlueZ
-exposes the battery level but not charging state, so `eweadn-battery --json`
-over Bluetooth includes `"charging_known": false`.
+The helper only considers BlueZ devices whose name contains `EWEADN`. It reads
+only the `Battery Percentage` property, so `eweadn-battery --json` over
+Bluetooth includes `"charging_known": false`.
 
 ## Requirements
 
