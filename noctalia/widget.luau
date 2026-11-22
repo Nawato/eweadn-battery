@@ -106,5 +106,9 @@ noctalia.state.watch("battery", render)
 render(noctalia.state.get("battery"))
 
 function onClick()
+	noctalia.togglePanel("nawato/eweadn-battery:control")
+end
+
+function onRightClick()
 	noctalia.state.set("refresh", (noctalia.state.get("refresh") or 0) + 1)
 end

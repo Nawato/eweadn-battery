@@ -12,6 +12,7 @@ install -d "$plugin_dir"
 install -m644 "$repo_dir/noctalia/plugin.toml" "$plugin_dir/plugin.toml"
 install -m644 "$repo_dir/noctalia/service.luau" "$plugin_dir/service.luau"
 install -m644 "$repo_dir/noctalia/widget.luau" "$plugin_dir/widget.luau"
+install -m644 "$repo_dir/noctalia/panel.luau" "$plugin_dir/panel.luau"
 
 echo "Installed the helper to $bin_home/eweadn-battery"
 echo "Installed the Noctalia plugin to $plugin_dir"
