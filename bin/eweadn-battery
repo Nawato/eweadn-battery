@@ -571,7 +571,7 @@ def backup_path() -> str:
     state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
     directory = os.path.join(state, "eweadn-battery", "backups")
     os.makedirs(directory, mode=0o700, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     return os.path.join(directory, f"eweadn-config-{stamp}.json")
 
 
