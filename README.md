@@ -7,8 +7,9 @@ The mouse/receiver does not expose a standard HID battery usage or a
 `power_supply` device, so UPower cannot see it. This project talks directly to
 the vendor HID interface, using the same protocol as EWEADN's web driver.
 
-- Battery percentage in the Noctalia bar
-- Control panel: polling rate, DPI stage/value, and button remapping
+- Battery percentage in the Noctalia bar over 2.4 GHz, USB cable, or Bluetooth
+- Control panel: polling rate, DPI stage/value, and button remapping over 2.4 GHz/USB
+- Bluetooth battery monitoring through BlueZ (battery only)
 - Charging state and a `?` marker when the last reading is stale
 - Low-battery notification at 15 %
 - Left-click the widget for the panel; right-click forces a refresh
@@ -37,10 +38,23 @@ The bundled udev rule matches `372e:1026` (the 8K receiver) and `372e:1027`
 (USB-cable mode). If you use a different receiver, add its ID from `lsusb` to
 the rule as another `ID_MODEL_ID` line.
 
+### Connectivity support
+
+| Link | Battery | Settings |
+| --- | --- | --- |
+| 2.4 GHz receiver | Yes | Yes |
+| USB cable | Yes | Yes |
+| Bluetooth LE | Yes, via BlueZ | No |
+
+EWEADN’s driver explicitly does not support settings over Bluetooth. In
+Bluetooth mode the widget still shows the battery level, but the panel disables
+polling/DPI/button controls and says so.
+
 ## Requirements
 
-- Linux with `hidraw`
+- Linux with `hidraw` for the 2.4 GHz receiver/cable
 - Python 3.10+
+- BlueZ and `bluetoothctl` for Bluetooth battery monitoring
 - [Noctalia](https://noctalia.dev) 5.6+ for the bar widget (the helper also
   works on its own)
 
@@ -75,6 +89,36 @@ eweadn-battery --json
 
 The rule grants access only to the vendor interface (interface 02), not to the
 mouse/keyboard HID nodes.
+
+### Bluetooth
+
+No udev rule is needed for Bluetooth. Switch the mouse to Bluetooth mode and
+pair it once:
+
+```sh
+bluetoothctl
+power on
+agent on
+default-agent
+scan on
+# select "EWEADN S9" when it appears
+pair XX:XX:XX:XX:XX:XX
+trust XX:XX:XX:XX:XX:XX
+connect XX:XX:XX:XX:XX:XX
+scan off
+exit
+```
+
+Verify BlueZ exposes a battery level:
+
+```sh
+bluetoothctl info XX:XX:XX:XX:XX:XX | grep -i 'Battery Percentage'
+eweadn-battery --json
+```
+
+The helper falls back to the connected EWEADN Bluetooth device when no USB
+receiver/cable is present. Bluetooth is battery-only; settings still require
+the receiver or cable.
 
 ### Noctalia
 
@@ -148,6 +192,10 @@ eweadn-battery set-button back dpi_loop --apply
 `media_play_pause`, `media_next`, `media_prev`, `media_mute`,
 `volume_up`, `volume_down`, `disabled`.
 
+Over Bluetooth, `config` returns the battery and
+`"settings_available": false`; the `set-*` commands require the 2.4 GHz
+receiver or the USB cable.
+
 The Noctalia panel exposes the same operations with Apply buttons. Each write
 saves a backup under `~/.local/state/eweadn-battery/backups/` and is verified by
 reading the config back from the mouse.
@@ -197,6 +245,11 @@ Settings use the same feature report with command/offset bytes:
 The exact key-position values and DPI encoding come from
 `@bytech/mouse-pix` 1.11.1.
 
+When no USB receiver/cable is available, the helper asks `bluetoothctl` for a
+connected EWEADN device and reads the BlueZ `Battery Percentage` property. It
+does not send vendor feature reports over Bluetooth, because EWEADN’s driver
+does not support that.
+
 The mouse sleeps when idle, so a poll can time out. The Noctalia widget keeps
 the last value, marks it with `?`, and shows the last-update time and error in
 its tooltip.
@@ -214,6 +267,17 @@ lsusb | grep -i 372e
 
 **`no reply (mouse asleep or out of range)`** — move the mouse, then click the
 widget or run the refresh command.
+
+**Bluetooth battery is missing** — check that the mouse is paired, connected,
+and exposing Battery1:
+
+```sh
+bluetoothctl info XX:XX:XX:XX:XX:XX | grep -Ei 'Connected|Battery'
+```
+
+If `Connected: yes` but no battery line appears, the mouse’s Bluetooth firmware
+does not expose the battery service; use the receiver or cable for battery
+telemetry.
 
 **Widget shows `--`** — Noctalia has not received a reading yet. Check
 `~/.cache/noctalia/noctalia.log` and run `eweadn-battery --json`.
