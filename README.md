@@ -28,6 +28,10 @@ The protocol is confirmed on `372e:1026` and `372e:103d`. Other receiver IDs
 are included because they share the same S9 protocol, but they have not all
 been tested.
 
+The bundled udev rule matches `372e:1026` (the 8K receiver). If you use a
+different receiver, replace `ID_MODEL_ID` in the rule with the ID reported by
+`lsusb`.
+
 ## Requirements
 
 - Linux with `hidraw`
