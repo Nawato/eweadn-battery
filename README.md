@@ -102,7 +102,7 @@ sudo udevadm trigger --subsystem-match=hidraw
 ```
 
 The rule matches only the vendor interface (`ID_USB_INTERFACE_NUM=02`) and uses
-`MODE="0600"` with `TAG+="uaccess"`; it does not add a shared group.
+`MODE="0660"` with `GROUP="root"` and `TAG+="uaccess"`; it does not add a shared group.
 `uaccess` grants an ACL to the active local seat user, while the node stays
 root-only when no such ACL applies. The mouse/keyboard HID nodes keep their
 normal permissions.
@@ -360,8 +360,8 @@ its tooltip. A stale charging state is shown as `Charging?`.
 ## Troubleshooting
 
 **`permission denied`** — install the udev rule above and replug the receiver.
-Check that the node has a `user:` ACL from `uaccess`: without it,
-`MODE="0600"` leaves the node root-only.
+Check `getfacl /dev/hidrawN`: the `uaccess` ACL should show your user with
+`rw-` and a non-empty mask. If it is missing, reload udev and replug.
 
 **`EWEADN receiver not found`** — check the receiver:
 
