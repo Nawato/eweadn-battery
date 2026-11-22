@@ -1,6 +1,33 @@
-# EWEADN S9 8K receiver (372e:1026) and USB-cable mode (372e:1027).
-# Grant the logged-in seat user access to the vendor HID interface only
-# (interface 2, usage page FF00), which is where the battery and settings
-# feature reports live.
-SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="372e", ENV{ID_MODEL_ID}=="1026", ENV{ID_USB_INTERFACE_NUM}=="02", MODE="0660", GROUP="users", TAG+="uaccess"
-SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="372e", ENV{ID_MODEL_ID}=="1027", ENV{ID_USB_INTERFACE_NUM}=="02", MODE="0660", GROUP="users", TAG+="uaccess"
+# EWEADN S9-family hidraw permissions.
+#
+# The vendor HID interface (interface 02, usage page FF00) carries the battery
+# and settings feature reports. Only that interface is matched, so the
+# mouse/keyboard hidraw nodes keep their normal permissions.
+#
+# TAG+="uaccess" grants an ACL to the active local seat user. MODE="0600" keeps
+# the node root-only when no uaccess ACL applies; no shared group is needed.
+#
+# Hardware-verified: 372e:1026 (S9 / S9 Pro 8K receiver) and 372e:1027 (S9
+# Ultra cable). 372e:103d uses the same confirmed protocol; 372e:1033,
+# 372e:1055 and 372e:105e share the S9 family layout but are untested on
+# hardware. All lines match only vendor interface 02; if a unit enumerates the
+# vendor interface differently, adjust its line.
+
+# EWEADN S9 / S9 Pro 8K receiver.
+SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="372e", ENV{ID_MODEL_ID}=="1026", ENV{ID_USB_INTERFACE_NUM}=="02", MODE="0600", TAG+="uaccess"
+
+# EWEADN S9 Ultra in USB-cable mode.
+SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="372e", ENV{ID_MODEL_ID}=="1027", ENV{ID_USB_INTERFACE_NUM}=="02", MODE="0600", TAG+="uaccess"
+
+# EWEADN S9 Pro 1K receiver (protocol confirmed).
+SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="372e", ENV{ID_MODEL_ID}=="103d", ENV{ID_USB_INTERFACE_NUM}=="02", MODE="0600", TAG+="uaccess"
+
+# Other S9-family receivers (untested on hardware).
+# 372e:1033.
+SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="372e", ENV{ID_MODEL_ID}=="1033", ENV{ID_USB_INTERFACE_NUM}=="02", MODE="0600", TAG+="uaccess"
+
+# 372e:1055.
+SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="372e", ENV{ID_MODEL_ID}=="1055", ENV{ID_USB_INTERFACE_NUM}=="02", MODE="0600", TAG+="uaccess"
+
+# 372e:105e.
+SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="372e", ENV{ID_MODEL_ID}=="105e", ENV{ID_USB_INTERFACE_NUM}=="02", MODE="0600", TAG+="uaccess"

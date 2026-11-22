@@ -2,7 +2,13 @@
 set -euo pipefail
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+
+# Noctalia-specific overrides take precedence over the XDG variables. Like the
+# XDG variables, they are "home roots", so the noctalia/ component is appended
+# below (NOCTALIA_DATA_HOME=/tmp/profile -> /tmp/profile/noctalia/plugins/...).
+data_home="${NOCTALIA_DATA_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}}"
+config_home="${NOCTALIA_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}}"
+
 # The Noctalia service resolves ~/.local/bin/eweadn-battery directly.
 bin_home="$HOME/.local/bin"
 plugin_dir="$data_home/noctalia/plugins/eweadn-battery"
@@ -18,7 +24,7 @@ echo "Installed the helper to $bin_home/eweadn-battery"
 echo "Installed the Noctalia plugin to $plugin_dir"
 echo
 
-config="${XDG_CONFIG_HOME:-$HOME/.config}/noctalia/config.toml"
+config="$config_home/noctalia/config.toml"
 if grep -q 'nawato/eweadn-battery' "$config" 2>/dev/null; then
 	echo "Noctalia config already references nawato/eweadn-battery."
 else
@@ -39,14 +45,28 @@ EOF
 	echo
 fi
 
-if grep -q '1027' /etc/udev/rules.d/70-eweadn-battery.rules 2>/dev/null; then
-	echo "The udev rule is already installed."
+# EWEADN_UDEV_RULE exists for installer tests; the default remains the system
+# path that the documented sudo install command targets.
+rule_src="$repo_dir/udev/70-eweadn-battery.rules"
+rule_dst="${EWEADN_UDEV_RULE:-/etc/udev/rules.d/70-eweadn-battery.rules}"
+
+print_udev_install() {
+	printf '  sudo install -Dm644 "%s" "%s"\n' "$rule_src" "$rule_dst"
+	printf '  sudo udevadm control --reload-rules\n'
+	printf '  sudo udevadm trigger --subsystem-match=hidraw\n'
+}
+
+if [[ -e "$rule_dst" ]] && cmp -s "$rule_src" "$rule_dst"; then
+	echo "The udev rule at $rule_dst is already installed and up to date."
+elif [[ -e "$rule_dst" ]]; then
+	echo "The udev rule at $rule_dst is stale and differs from the bundled rule; update it:"
+	echo
+	print_udev_install
+	echo
 else
 	echo "Install the udev rule (required for the 2.4 GHz receiver):"
 	echo
-	echo "  sudo install -Dm644 \"$repo_dir/udev/70-eweadn-battery.rules\" /etc/udev/rules.d/70-eweadn-battery.rules"
-	echo "  sudo udevadm control --reload-rules"
-	echo "  sudo udevadm trigger --subsystem-match=hidraw"
+	print_udev_install
 	echo
 fi
 
